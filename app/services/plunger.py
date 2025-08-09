@@ -9,10 +9,9 @@ from typing import Dict, Literal, Optional
 
 logger = logging.getLogger("plunger")
 
-# =========================
-# Backend selection/runtime
-# =========================
-
+# -------------------------
+# Runtime / backend state
+# -------------------------
 _BACKEND: Optional[Literal["pigpio", "rpigpio"]] = None
 _LOCK = threading.RLock()
 
@@ -23,10 +22,9 @@ _pi = None      # pigpio.pi()
 # RPi.GPIO runtime
 _rpi = None     # module
 
-# =========================
-# Configuration / State
-# =========================
-
+# -------------------------
+# Configuration
+# -------------------------
 @dataclass
 class Pins:
     enable_pin: int = 18          # BCM numbering
@@ -43,21 +41,18 @@ class State:
 
 _state = State()
 
-_MIN_DELAY_US = 200               # lower bound on half-period (us)
-_MAX_STEPS = 500_000              # safety cap per jog call
+_MIN_DELAY_US = 200               # half-period floor (us)
+_MAX_STEPS = 500_000              # safety cap per jog
 
-# =========================
+# -------------------------
 # Public API
-# =========================
-
+# -------------------------
 def init(cfg: Optional[Dict] = None) -> None:
     """
-    Initialize the plunger driver.
-
+    Initialize plunger backend.
     Optional cfg keys:
-      enable_pin (int, BCM), step_pin (int), dir_pin (int),
-      enable_active_low (bool), dir_invert (bool),
-      backend: "pigpio" | "rpigpio" | None (auto-detect)
+      enable_pin, step_pin, dir_pin (BCM), enable_active_low, dir_invert,
+      backend: "pigpio" | "rpigpio" | None (auto)
     """
     global _BACKEND, _pigpio, _pi, _rpi
 
@@ -66,7 +61,8 @@ def init(cfg: Optional[Dict] = None) -> None:
             logger.info("plunger.init(): already initialized (backend=%s)", _BACKEND)
             return
 
-        # Apply configuration
+        # Apply config
+        forced = None
         if cfg:
             p = _state.pins
             _state.pins = Pins(
@@ -77,14 +73,12 @@ def init(cfg: Optional[Dict] = None) -> None:
                 dir_invert=bool(cfg.get("dir_invert", p.dir_invert)),
             )
             forced = cfg.get("backend")
-        else:
-            forced = None
 
-        # Choose backend
+        # Backend choice
         if forced in ("pigpio", "rpigpio"):
             choice = forced
         else:
-            # Prefer pigpio if daemon available
+            # Prefer pigpio if daemon running
             try:
                 import pigpio as _tmp_pigpio  # type: ignore
                 pi = _tmp_pigpio.pi()
@@ -94,23 +88,29 @@ def init(cfg: Optional[Dict] = None) -> None:
                 _pi = pi
                 choice = "pigpio"
             except Exception as e:
-                logger.info("pigpio unavailable (%s); falling back to RPi.GPIO", e)
+                logger.info("pigpio unavailable (%s); will try RPi.GPIO", e)
                 choice = "rpigpio"
 
         if choice == "pigpio":
-            # Configure pins
-            _pi.set_mode(_state.pins.enable_pin, _pigpio.OUTPUT)
-            _pi.set_mode(_state.pins.step_pin, _pigpio.OUTPUT)
-            _pi.set_mode(_state.pins.dir_pin, _pigpio.OUTPUT)
-            _set_enable_hw(False)
-            _pi.write(_state.pins.step_pin, 0)
-            _BACKEND = "pigpio"
-            _state.initialized = True
-            logger.info(
-                "Plunger initialized (pigpio) EN=%s STEP=%s DIR=%s",
-                _state.pins.enable_pin, _state.pins.step_pin, _state.pins.dir_pin
-            )
-            return
+            try:
+                # Set mode
+                _pi.set_mode(_state.pins.enable_pin, _pigpio.OUTPUT)
+                _pi.set_mode(_state.pins.step_pin, _pigpio.OUTPUT)
+                _pi.set_mode(_state.pins.dir_pin, _pigpio.OUTPUT)
+                # Mark backend BEFORE touching helpers that depend on it
+                _set_backend("pigpio")
+                # Initialize pins
+                _pi.write(_state.pins.step_pin, 0)
+                _set_enable_hw(False)
+                _state.initialized = True
+                logger.info(
+                    "Plunger initialized (pigpio) EN=%s STEP=%s DIR=%s",
+                    _state.pins.enable_pin, _state.pins.step_pin, _state.pins.dir_pin
+                )
+                return
+            except Exception as e:
+                logger.warning("pigpio init failed: %s", e, exc_info=True)
+                # fall through to try RPi.GPIO
 
         # Fallback: RPi.GPIO
         try:
@@ -118,34 +118,31 @@ def init(cfg: Optional[Dict] = None) -> None:
             _rpi = GPIO
             _rpi.setmode(GPIO.BCM)
             _rpi.setwarnings(False)
+            # Mark backend BEFORE helper use
+            _set_backend("rpigpio")
+            # Configure pins
             _rpi.setup(_state.pins.enable_pin, GPIO.OUT, initial=_inactive_level())
             _rpi.setup(_state.pins.step_pin, GPIO.OUT, initial=GPIO.LOW)
             _rpi.setup(_state.pins.dir_pin, GPIO.OUT, initial=GPIO.LOW)
-            _BACKEND = "rpigpio"
             _state.initialized = True
             logger.info(
                 "Plunger initialized (RPi.GPIO) EN=%s STEP=%s DIR=%s",
                 _state.pins.enable_pin, _state.pins.step_pin, _state.pins.dir_pin
             )
         except Exception as e:
-            _BACKEND = None
+            # Soft-fail: do not crash the whole app
+            _clear_backend()
             _state.initialized = False
-            logger.error("GPIO backend init failed (need pigpio or RPi.GPIO): %s", e, exc_info=True)
-            raise RuntimeError("No usable GPIO backend found")
+            logger.warning(
+                "No usable GPIO backend (install/start pigpio OR install python3-rpi.gpio). "
+                "Plunger disabled; server will still start. Details: %s", e
+            )
+            return
 
 def jog(steps: int, enable: bool = True, delay_us: int = 1200) -> Dict[str, object]:
-    """
-    Jog the stepper by a signed number of steps.
-      steps > 0 => forward
-      steps < 0 => reverse
-
-    Args:
-      steps: number of steps (|steps| <= _MAX_STEPS)
-      enable: assert ENABLE during motion, then restore previous state
-      delay_us: half-period in microseconds (controls speed). Effective step rate ~ 1/(2*delay_us).
-    """
-    if not _state.initialized:
-        raise RuntimeError("Plunger not initialized")
+    """Jog stepper by a signed number of steps."""
+    if not _state.initialized or _BACKEND is None:
+        raise RuntimeError("Plunger not initialized (no GPIO backend)")
 
     if steps == 0:
         return {"ok": True, "steps": 0, "direction": "none", "backend": _BACKEND}
@@ -155,7 +152,6 @@ def jog(steps: int, enable: bool = True, delay_us: int = 1200) -> Dict[str, obje
 
     delay_us = max(_MIN_DELAY_US, int(delay_us))
 
-    # Determine direction and absolute steps
     direction_fwd = (steps > 0)
     if _state.pins.dir_invert:
         direction_fwd = not direction_fwd
@@ -173,7 +169,7 @@ def jog(steps: int, enable: bool = True, delay_us: int = 1200) -> Dict[str, obje
         elif _BACKEND == "rpigpio":
             _pulse_rpigpio(abs_steps, delay_us)
         else:
-            raise RuntimeError("No GPIO backend available at runtime")
+            raise RuntimeError("No GPIO backend available")
 
         if enable and not prev_enabled:
             _set_enable_hw(False)
@@ -187,78 +183,80 @@ def jog(steps: int, enable: bool = True, delay_us: int = 1200) -> Dict[str, obje
     }
 
 def shutdown() -> None:
-    """Disable the driver and release resources."""
-    global _pi, _pigpio, _rpi, _BACKEND
+    """Disable driver and release resources."""
     with _LOCK:
         try:
-            if _state.initialized:
+            if _state.initialized and _BACKEND is not None:
                 _set_enable_hw(False)
         except Exception:
             logger.warning("Error disabling driver on shutdown", exc_info=True)
 
+        # Stop pigpio
         try:
             if _BACKEND == "pigpio" and _pi is not None:
                 _pi.stop()
         except Exception:
             logger.warning("Error stopping pigpio", exc_info=True)
 
+        # Cleanup RPi.GPIO
         try:
             if _BACKEND == "rpigpio" and _rpi is not None:
                 _rpi.cleanup()
         except Exception:
             logger.warning("RPi.GPIO cleanup failed", exc_info=True)
 
-        _pi = None
-        _pigpio = None
-        _rpi = None
-        _BACKEND = None
+        _clear_backend()
         _state.initialized = False
         _state.enabled = False
         logger.info("Plunger shutdown complete")
 
-# =========================
-# Hardware helpers
-# =========================
+# -------------------------
+# Helpers
+# -------------------------
+def _set_backend(name: Optional[str]) -> None:
+    global _BACKEND
+    if name not in (None, "pigpio", "rpigpio"):
+        raise ValueError("invalid backend")
+    _BACKEND = name  # type: ignore
+
+def _clear_backend() -> None:
+    global _pi, _pigpio, _rpi, _BACKEND
+    _pi = None
+    _pigpio = None
+    _rpi = None
+    _BACKEND = None
 
 def _inactive_level() -> int:
-    """GPIO level that disables the stepper driver."""
     return 0 if not _state.pins.enable_active_low else 1
 
 def _active_level() -> int:
-    """GPIO level that enables the stepper driver."""
     return 1 - _inactive_level()
 
 def _set_enable_hw(value: bool) -> None:
-    lvl = _active_level() if value else _inactive_level()
     if _BACKEND == "pigpio":
+        lvl = _active_level() if value else _inactive_level()
         _pi.write(_state.pins.enable_pin, lvl)
     elif _BACKEND == "rpigpio":
+        lvl = _active_level() if value else _inactive_level()
         _rpi.output(_state.pins.enable_pin, lvl)
     else:
         raise RuntimeError("No GPIO backend available")
     _state.enabled = value
 
 def _set_dir_hw(forward: bool) -> None:
-    lvl = 1 if forward else 0
     if _BACKEND == "pigpio":
-        _pi.write(_state.pins.dir_pin, lvl)
+        _pi.write(_state.pins.dir_pin, 1 if forward else 0)
     elif _BACKEND == "rpigpio":
-        _rpi.output(_state.pins.dir_pin, lvl)
+        _rpi.output(_state.pins.dir_pin, 1 if forward else 0)
     else:
         raise RuntimeError("No GPIO backend available")
 
 def _pulse_pigpio(steps: int, delay_us: int) -> None:
-    """
-    pigpio waveform for accurate pulse timing:
-      (HIGH delay_us) + (LOW delay_us) repeated for each step.
-    """
     step_gpio = _state.pins.step_pin
     pulses = []
-    # pigpio.pulse(gpio_on, gpio_off, delay_us)
     for _ in range(steps):
         pulses.append(_pigpio.pulse(1 << step_gpio, 0, delay_us))
         pulses.append(_pigpio.pulse(0, 1 << step_gpio, delay_us))
-
     _pi.wave_clear()
     _pi.wave_add_generic(pulses)
     wave_id = _pi.wave_create()
@@ -272,15 +270,11 @@ def _pulse_pigpio(steps: int, delay_us: int) -> None:
         _pi.wave_delete(wave_id)
 
 def _pulse_rpigpio(steps: int, delay_us: int) -> None:
-    """
-    Software-timed pulsing via RPi.GPIO. Jitter is higher than pigpio,
-    but acceptable at moderate speeds.
-    """
-    step_pin = _state.pins.step_pin
+    pin = _state.pins.step_pin
     on_t = delay_us / 1_000_000.0
     off_t = on_t
     for _ in range(steps):
-        _rpi.output(step_pin, _rpi.HIGH)
+        _rpi.output(pin, _rpi.HIGH)
         time.sleep(on_t)
-        _rpi.output(step_pin, _rpi.LOW)
+        _rpi.output(pin, _rpi.LOW)
         time.sleep(off_t)
