@@ -1,0 +1,91 @@
+# =========================
+# Card Sorter Configuration
+# =========================
+
+# -------------------------
+# Camera settings
+# -------------------------
+camera:
+  # device: "/dev/video0"   # Optional: Force OpenCV/V4L2 backend. Leave commented to auto-select Picamera2
+  resolution: [1920, 1080]  # width, height in pixels
+  preview_fps: 5            # Preview refresh rate (best effort)
+
+# -------------------------
+# OCR settings
+# -------------------------
+ocr:
+  engine: "tesseract"       # Currently only "tesseract" supported
+  lang: "eng"               # Tesseract language code
+  psm: 6                    # Page segmentation mode: 6 = single uniform block of text
+  whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz' :-"
+  enable_orientation: true  # Detect rotation angle
+  enable_deskew: true       # Deskew image using detected rotation
+  gamma: 1.0                 # Gamma correction (1.0 = none)
+  denoise: true              # Apply light denoising
+  unsharp: true              # Apply unsharp mask for clarity
+  adaptive_thresh: true      # Use adaptive threshold binarization
+  invert_if_needed: true     # Auto-invert if dark background
+  otsu_fallback: true        # Fallback to Otsu threshold if adaptive fails
+
+# -------------------------
+# Assignment (slot mapping) settings
+# -------------------------
+assignment:
+  mode: "first_letter"       # "first_letter" or "csv_lookup"
+  default_slot: null         # e.g., 99 to send unrecognized to slot 99; null = no assignment
+  slots_csv: "slots.csv"     # Path to CSV for csv_lookup mode (ignored for first_letter)
+  # Optional letter grouping for first_letter mode:
+  first_letter_groups:
+    # "ABC": 1
+    # "DEF": 2
+    # "GHIJK": 3
+
+# -------------------------
+# Grid settings for MPCNC slot positions
+# -------------------------
+grid:
+  origin_mm: [0.0, 0.0]      # Machine coordinates (X0,Y0) for slot (row=0,col=0) center
+  pitch_mm: [70.0, 95.0]     # Distance between slot centers (X, Y) in mm
+  rows: 5
+  cols: 10
+  z:
+    pick: -2.0               # Z height for picking/placing card
+    travel: 15.0             # Z height for moving between slots
+    safe: 20.0               # Z height for safe clearance above all slots
+
+# -------------------------
+# Motion (MPCNC / SKR Pro) settings
+# -------------------------
+motion:
+  port: "/dev/ttyACM0"       # Serial port to SKR Pro 1.2
+  baud: 250000
+  enable: false              # Start disabled; must be enabled via API/UI before moving
+  homing_sequence:
+    - "G28"                  # Home all axes
+  feedrates:
+    xy: 3000                  # mm/min for XY moves
+    z: 600                    # mm/min for Z moves
+
+# -------------------------
+# Plunger (vacuum head stepper) settings
+# -------------------------
+plunger:
+  enable_pin: 18              # BCM numbering
+  step_pin: 23
+  dir_pin: 24
+  enable_active_low: true
+  dir_invert: false
+  backend: null               # null = auto, or "pigpio" / "rpigpio"
+
+# -------------------------
+# Server & logging
+# -------------------------
+server:
+  host: "0.0.0.0"
+  port: 8000
+
+logging:
+  level: "INFO"               # DEBUG, INFO, WARNING, ERROR
+
+cors:
+  allow_origins: ["*"]        # CORS allowlist for web UI connections

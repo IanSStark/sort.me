@@ -1,0 +1,45 @@
+# -------------------------
+# Core web framework & server
+# -------------------------
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+jinja2==3.1.4
+python-multipart==0.0.9
+
+# -------------------------
+# Database / ORM
+# -------------------------
+sqlmodel==0.0.22
+pydantic==1.10.17       # sqlmodel still on pydantic v1
+sqlite-utils==3.36      # optional CLI for debugging DB
+
+# -------------------------
+# Camera & image processing
+# -------------------------
+opencv-python==4.10.0.84
+numpy==1.26.4
+
+# Picamera2 is only for Raspberry Pi (installable via apt, not PyPI)
+# For Pi: sudo apt install -y python3-picamera2
+
+# -------------------------
+# OCR
+# -------------------------
+pytesseract==0.3.10
+
+# -------------------------
+# Serial comms for motion control
+# -------------------------
+pyserial==3.5
+
+# -------------------------
+# GPIO / stepper control (plunger)
+# -------------------------
+# pigpio requires system-level install of pigpio daemon on Raspberry Pi
+pigpio==1.78
+RPi.GPIO==0.7.1
+
+# -------------------------
+# YAML config parsing
+# -------------------------
+pyyaml==6.0.2
