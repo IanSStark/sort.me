@@ -163,4 +163,43 @@ def shutdown() -> None:
 
 # --- helpers ---
 def _inactive_level() -> int:
-    return 0 if
+    return 0 if not _state.pins.enable_active_low else 1
+def _active_level() -> int:
+    return 1 - _inactive_level()
+def _set_enable_hw(value: bool) -> None:
+    lvl = _active_level() if value else _inactive_level()
+    if _BACKEND == "pigpio":
+        _pi.write(_state.pins.enable_pin, lvl)
+    elif _BACKEND == "rpigpio":
+        _rpi.output(_state.pins.enable_pin, lvl)
+    _state.enabled = value
+def _set_dir_hw(forward: bool) -> None:
+    lvl = 1 if forward else 0
+    if _BACKEND == "pigpio":
+        _pi.write(_state.pins.dir_pin, lvl)
+    elif _BACKEND == "rpigpio":
+        _rpi.output(_state.pins.dir_pin, lvl)
+def _pulse_pigpio(steps: int, delay_us: int) -> None:
+    pulses = []
+    step = _state.pins.step_pin
+    for _ in range(steps):
+        pulses.append(_pigpio.pulse(1 << step, 0, delay_us))
+        pulses.append(_pigpio.pulse(0, 1 << step, delay_us))
+    _pi.wave_clear()
+    _pi.wave_add_generic(pulses)
+    wave_id = _pi.wave_create()
+    if wave_id < 0:
+        raise RuntimeError("pigpio wave_create failed")
+    try:
+        _pi.wave_send_once(wave_id)
+        while _pi.wave_tx_busy():
+            time.sleep(0.001)
+    finally:
+        _pi.wave_delete(wave_id)
+def _pulse_rpigpio(steps: int, delay_us: int) -> None:
+    on = delay_us / 1_000_000.0
+    off = on
+    pin = _state.pins.step_pin
+    for _ in range(steps):
+        _rpi.output(pin, _rpi.HIGH); time.sleep(on)
+        _rpi.output(pin, _rpi.LOW);  time.sleep(off)
