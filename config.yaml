@@ -6,9 +6,10 @@
 # Camera settings
 # -------------------------
 camera:
-  # device: "/dev/video0"   # Optional: Force OpenCV/V4L2 backend. Leave commented to auto-select Picamera2
-  resolution: [1920, 1080]  # width, height in pixels
-  preview_fps: 5            # Preview refresh rate (best effort)
+  # device:            # keep commented
+  resolution: [1280, 720]
+  preview_fps: 5
+
 
 # -------------------------
 # OCR settings
