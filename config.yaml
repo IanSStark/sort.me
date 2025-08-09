@@ -32,14 +32,11 @@ ocr:
 # Assignment (slot mapping) settings
 # -------------------------
 assignment:
-  mode: "first_letter"       # "first_letter" or "csv_lookup"
-  default_slot: null         # e.g., 99 to send unrecognized to slot 99; null = no assignment
-  slots_csv: "slots.csv"     # Path to CSV for csv_lookup mode (ignored for first_letter)
-  # Optional letter grouping for first_letter mode:
-  first_letter_groups:
-    # "ABC": 1
-    # "DEF": 2
-    # "GHIJK": 3
+  mode: "first_letter"
+  slots_csv: "slots.csv"
+  default_slot: null
+  first_letter_groups: null
+
 
 # -------------------------
 # Grid settings for MPCNC slot positions
