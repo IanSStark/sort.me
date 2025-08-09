@@ -12,7 +12,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import yaml
 from fastapi import (
     BackgroundTasks,
-    Depends,
     FastAPI,
     HTTPException,
     Path as FPath,
@@ -23,21 +22,26 @@ from fastapi import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field, ValidationError
 
-# ---- Local modules (implement these per the earlier skeleton) ----
-# They should be importable; keep function names stable.
+# Local modules
 from app import models
 from app.services import camera, ocr, assign as assign_srv, motion, plunger
 
 APP_NAME = "Card Sorter"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.3.0"
 
 # ======================================================================
-# Configuration
+# Config models
 # ======================================================================
 
 class OCRConfig(BaseModel):
@@ -45,11 +49,19 @@ class OCRConfig(BaseModel):
     lang: str = "eng"
     psm: int = 6
     whitelist: Optional[str] = None
+    enable_orientation: bool = True
+    enable_deskew: bool = True
+    gamma: float = 1.0
+    denoise: bool = True
+    unsharp: bool = True
+    adaptive_thresh: bool = True
+    invert_if_needed: bool = True
+    otsu_fallback: bool = True
 
 
 class CameraConfig(BaseModel):
-    device: Optional[str] = None  # "/dev/video0" or None to auto
-    resolution: Tuple[int, int] = (1920, 1080)
+    device: Optional[str] = None          # e.g., "/dev/video0"; None => prefer Picamera2
+    resolution: Tuple[int, int] = (1280, 720)
     preview_fps: int = 5
 
 
@@ -70,9 +82,19 @@ class GridConfig(BaseModel):
 
 
 class AssignmentConfig(BaseModel):
-    mode: str = "first_letter"        # or "csv_lookup"
+    mode: str = "first_letter"            # or "csv_lookup"
     slots_csv: Optional[str] = None
     default_slot: Optional[int] = None
+    first_letter_groups: Dict[str, int] = Field(default_factory=dict)
+
+
+class PlungerConfig(BaseModel):
+    enable_pin: int = 18
+    step_pin: int = 23
+    dir_pin: int = 24
+    enable_active_low: bool = True
+    dir_invert: bool = False
+    backend: Optional[str] = None         # "pigpio" | "rpigpio" | None (auto)
 
 
 class AppConfig(BaseModel):
@@ -81,6 +103,7 @@ class AppConfig(BaseModel):
     assignment: AssignmentConfig = AssignmentConfig()
     grid: GridConfig = GridConfig()
     motion: MotionConfig = MotionConfig()
+    plunger: PlungerConfig = PlungerConfig()
     server: Dict[str, Any] = Field(default_factory=lambda: {"host": "0.0.0.0", "port": 8000})
     logging: Dict[str, Any] = Field(default_factory=lambda: {"level": "INFO"})
     cors: Dict[str, Any] = Field(default_factory=lambda: {"allow_origins": ["*"]})
@@ -88,11 +111,10 @@ class AppConfig(BaseModel):
 
 def load_config() -> AppConfig:
     cfg_path = Path("config.yaml")
+    raw: Dict[str, Any] = {}
     if cfg_path.exists():
         with cfg_path.open("r") as f:
             raw = yaml.safe_load(f) or {}
-    else:
-        raw = {}
     try:
         return AppConfig(**raw)
     except ValidationError as e:
@@ -114,7 +136,7 @@ logging.basicConfig(
 logger = logging.getLogger(APP_NAME)
 
 # ======================================================================
-# FastAPI app setup
+# FastAPI app bootstrap
 # ======================================================================
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
@@ -122,6 +144,8 @@ app = FastAPI(title=APP_NAME, version=APP_VERSION)
 # Static & templates
 STATIC_DIR = Path(__file__).parent / "static"
 TEMPLATES_DIR = Path(__file__).parent / "templates"
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
+TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
@@ -135,13 +159,12 @@ app.add_middleware(
 )
 
 # ======================================================================
-# Schemas
+# Pydantic response models
 # ======================================================================
 
 class HealthResponse(BaseModel):
     status: str
     version: str
-
 
 class StatusResponse(BaseModel):
     camera: bool
@@ -150,11 +173,9 @@ class StatusResponse(BaseModel):
     motion_port: Optional[str] = None
     db_ok: bool
 
-
 class CaptureResponse(BaseModel):
     capture_id: int
     path: str
-
 
 class OCRResponse(BaseModel):
     ocr_id: int
@@ -162,28 +183,23 @@ class OCRResponse(BaseModel):
     confidence: int
     boxes: Dict[str, Any]
 
-
 class AssignmentResponse(BaseModel):
     assignment_id: int
     slot_id: Optional[int]
     rule_used: str
 
-
 class MovePlanResponse(BaseModel):
     move_id: Optional[int] = None
     gcode: List[str]
-
 
 class ToggleResponse(BaseModel):
     ok: bool
     enabled: Optional[bool] = None
     error: Optional[str] = None
 
-
 class ListCapturesResponse(BaseModel):
     total: int
     items: List[Dict[str, Any]]
-
 
 # ======================================================================
 # Error handlers
@@ -194,32 +210,35 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     logger.warning("Validation error: %s", exc)
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
-
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
     logger.exception("Unhandled error")
     return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
-
 # ======================================================================
-# App lifecycle
+# Lifecycle
 # ======================================================================
 
 @app.on_event("startup")
 async def on_startup() -> None:
     logger.info("Starting %s v%s", APP_NAME, APP_VERSION)
 
-    # Initialize DB
+    # DB & schema
     models.init_db()
 
-    # Initialize services with config
+    # Services
     camera.init(
         device=CONFIG.camera.device,
         resolution=CONFIG.camera.resolution,
         preview_fps=CONFIG.camera.preview_fps,
     )
     ocr.init(cfg=CONFIG.ocr.dict())
-    assign_srv.init(cfg=CONFIG.assignment.dict())
+    assign_srv.init(cfg={
+        "mode": CONFIG.assignment.mode,
+        "default_slot": CONFIG.assignment.default_slot,
+        "slots_csv": CONFIG.assignment.slots_csv,
+        "first_letter_groups": CONFIG.assignment.first_letter_groups,
+    })
     motion.init(cfg={
         "port": CONFIG.motion.port,
         "baud": CONFIG.motion.baud,
@@ -228,15 +247,12 @@ async def on_startup() -> None:
         "feedrates": CONFIG.motion.feedrates,
         "grid": CONFIG.grid.dict(),
     })
-    plunger.init()  # implement safe defaults inside plunger service
-
-    # Optional warm-up checks
-    db_ok = models.health_check()
-    if not db_ok:
-        logger.error("Database health check failed")
+    try:
+        plunger.init(cfg=CONFIG.plunger.dict())
+    except Exception as e:
+        logger.warning("Plunger init soft-failed: %s", e)
 
     logger.info("Startup complete")
-
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
@@ -254,40 +270,35 @@ async def on_shutdown() -> None:
     except Exception:
         logger.warning("Plunger shutdown issue", exc_info=True)
 
-
 # Graceful termination for uvicorn/gunicorn
 def _install_signal_handlers():
     loop = asyncio.get_event_loop()
-
     def handle_sigterm():
         logger.info("SIGTERM received, stopping loop")
         loop.stop()
-
     try:
         loop.add_signal_handler(signal.SIGTERM, handle_sigterm)
     except NotImplementedError:
-        # Windows
         pass
-
 _install_signal_handlers()
 
 # ======================================================================
-# WebSocket for live status/logs
+# WebSocket for live status
 # ======================================================================
 
 class ConnectionManager:
-    def __init__(self):
+    def __init__(self) -> None:
         self.active: List[WebSocket] = []
 
-    async def connect(self, ws: WebSocket):
+    async def connect(self, ws: WebSocket) -> None:
         await ws.accept()
         self.active.append(ws)
 
-    def disconnect(self, ws: WebSocket):
+    def disconnect(self, ws: WebSocket) -> None:
         if ws in self.active:
             self.active.remove(ws)
 
-    async def broadcast(self, message: Dict[str, Any]):
+    async def broadcast(self, message: Dict[str, Any]) -> None:
         dead = []
         for ws in self.active:
             try:
@@ -299,27 +310,24 @@ class ConnectionManager:
 
 ws_manager = ConnectionManager()
 
-
 @app.websocket("/ws/status")
 async def ws_status(ws: WebSocket):
     await ws_manager.connect(ws)
     try:
         while True:
-            # A simple heartbeat/status push
-            status = {
+            payload = {
                 "camera": camera.status(),
                 "ocr": ocr.status(),
                 "motion_enabled": motion.enabled(),
                 "db_ok": models.health_check(),
             }
-            await ws.send_text(json.dumps(status))
+            await ws.send_text(json.dumps(payload))
             await asyncio.sleep(1.0)
     except WebSocketDisconnect:
         ws_manager.disconnect(ws)
     except Exception:
         ws_manager.disconnect(ws)
         logger.exception("WebSocket error")
-
 
 # ======================================================================
 # Routes
@@ -329,23 +337,16 @@ async def ws_status(ws: WebSocket):
 async def index(request: Request):
     return templates.TemplateResponse(
         "index.html",
-        {
-            "request": request,
-            "app_name": APP_NAME,
-            "version": APP_VERSION,
-        },
+        {"request": request, "app_name": APP_NAME, "version": APP_VERSION},
     )
-
 
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     return HealthResponse(status="ok", version=APP_VERSION)
 
-
 @app.get("/version")
 async def version():
     return {"name": APP_NAME, "version": APP_VERSION}
-
 
 @app.get("/status", response_model=StatusResponse)
 async def get_status() -> StatusResponse:
@@ -357,15 +358,12 @@ async def get_status() -> StatusResponse:
         db_ok=models.health_check(),
     )
 
+# ---- Captures / OCR / Assignment ----
 
 @app.get("/captures", response_model=ListCapturesResponse)
-async def list_captures(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=200),
-) -> ListCapturesResponse:
+async def list_captures(page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=200)):
     total, rows = models.list_captures(page=page, page_size=page_size)
     return ListCapturesResponse(total=total, items=rows)
-
 
 @app.get("/captures/{capture_id}")
 async def get_capture(capture_id: int = FPath(..., ge=1)):
@@ -374,20 +372,17 @@ async def get_capture(capture_id: int = FPath(..., ge=1)):
         raise HTTPException(status_code=404, detail="Capture not found")
     return row
 
-
 @app.post("/capture", response_model=CaptureResponse)
 async def do_capture(background_tasks: BackgroundTasks) -> CaptureResponse:
     try:
         path = camera.capture()
         capture_id = models.record_capture(path)
-        # Optionally trigger thumbnail gen in background
         background_tasks.add_task(models.generate_thumbnail, path)
         await ws_manager.broadcast({"event": "capture", "capture_id": capture_id})
         return CaptureResponse(capture_id=capture_id, path=path)
     except Exception as e:
         logger.exception("Camera capture failed")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/ocr/{capture_id}", response_model=OCRResponse)
 async def do_ocr(capture_id: int = FPath(..., ge=1)) -> OCRResponse:
@@ -403,7 +398,6 @@ async def do_ocr(capture_id: int = FPath(..., ge=1)) -> OCRResponse:
         logger.exception("OCR failed")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/assign/{ocr_id}", response_model=AssignmentResponse)
 async def assign_slot(ocr_id: int = FPath(..., ge=1)) -> AssignmentResponse:
     row = models.get_ocr(ocr_id)
@@ -414,6 +408,7 @@ async def assign_slot(ocr_id: int = FPath(..., ge=1)) -> AssignmentResponse:
     await ws_manager.broadcast({"event": "assign", "assignment_id": assignment_id})
     return AssignmentResponse(assignment_id=assignment_id, **decision)
 
+# ---- Motion ----
 
 @app.post("/motion/plan/{assignment_id}", response_model=MovePlanResponse)
 async def motion_plan(assignment_id: int = FPath(..., ge=1)) -> MovePlanResponse:
@@ -423,7 +418,6 @@ async def motion_plan(assignment_id: int = FPath(..., ge=1)) -> MovePlanResponse
     except Exception as e:
         logger.exception("Plan failed")
         raise HTTPException(status_code=400, detail=str(e))
-
 
 @app.post("/motion/queue/{assignment_id}", response_model=MovePlanResponse)
 async def motion_queue(assignment_id: int = FPath(..., ge=1)) -> MovePlanResponse:
@@ -435,7 +429,6 @@ async def motion_queue(assignment_id: int = FPath(..., ge=1)) -> MovePlanRespons
     except Exception as e:
         logger.exception("Queue failed")
         raise HTTPException(status_code=400, detail=str(e))
-
 
 @app.post("/motion/execute/{move_id}")
 async def motion_execute(move_id: int = FPath(..., ge=1)):
@@ -449,7 +442,6 @@ async def motion_execute(move_id: int = FPath(..., ge=1)):
         logger.exception("Execute failed")
         raise HTTPException(status_code=400, detail=str(e))
 
-
 @app.post("/motion/enable", response_model=ToggleResponse)
 async def motion_enable() -> ToggleResponse:
     try:
@@ -459,7 +451,6 @@ async def motion_enable() -> ToggleResponse:
     except Exception as e:
         logger.exception("Enable motion failed")
         return ToggleResponse(ok=False, error=str(e))
-
 
 @app.post("/motion/disable", response_model=ToggleResponse)
 async def motion_disable() -> ToggleResponse:
@@ -471,17 +462,14 @@ async def motion_disable() -> ToggleResponse:
         logger.exception("Disable motion failed")
         return ToggleResponse(ok=False, error=str(e))
 
+# ---- Plunger ----
 
 @app.post("/plunger/jog")
 async def plunger_jog(
-    steps: int = Query(..., ge=-10000, le=10000),
+    steps: int = Query(..., ge=-1_000_000, le=1_000_000),
     enable: bool = Query(True),
     delay_us: int = Query(1200, ge=100, le=20000),
 ):
-    """
-    Simple direct jog for the vacuum plunger stepper.
-    Positive steps move one direction; negative steps the opposite.
-    """
     try:
         res = plunger.jog(steps=steps, enable=enable, delay_us=delay_us)
         await ws_manager.broadcast({"event": "plunger", "steps": steps})
@@ -490,9 +478,90 @@ async def plunger_jog(
         logger.exception("Plunger jog failed")
         raise HTTPException(status_code=400, detail=str(e))
 
+# ---- Camera helpers ----
+
+@app.get("/camera/snapshot")
+async def camera_snapshot():
+    try:
+        jpeg = camera.grab_jpeg()
+        return Response(content=jpeg, media_type="image/jpeg")
+    except Exception as e:
+        logger.exception("Snapshot failed")
+        return PlainTextResponse(str(e), status_code=500)
+
+@app.get("/camera/stream")
+async def camera_stream():
+    """
+    MJPEG stream for <img src="/camera/stream">.
+    """
+    async def gen():
+        boundary = b"--frame\r\n"
+        while True:
+            try:
+                jpeg = camera.grab_jpeg()
+                yield boundary
+                yield b"Content-Type: image/jpeg\r\n"
+                yield b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
+                yield jpeg + b"\r\n"
+            except Exception as e:
+                logger.debug("Stream frame error: %s", e)
+                await asyncio.sleep(0.2)
+            # ~preview_fps
+            await asyncio.sleep(max(0.01, 1.0 / max(CONFIG.camera.preview_fps, 1)))
+    return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+@app.get("/camera/capture", response_model=CaptureResponse)
+async def camera_capture_alias(background_tasks: BackgroundTasks) -> CaptureResponse:
+    try:
+        path = camera.capture()
+        capture_id = models.record_capture(path)
+        background_tasks.add_task(models.generate_thumbnail, path)
+        await ws_manager.broadcast({"event": "capture", "capture_id": capture_id})
+        return CaptureResponse(capture_id=capture_id, path=path)
+    except Exception as e:
+        logger.exception("Camera capture failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---- One-button pipeline: capture → OCR → assign → plan (queue) ----
+
+@app.post("/sort")
+async def sort_one():
+    try:
+        # Capture
+        path = camera.capture()
+        capture_id = models.record_capture(path)
+
+        # OCR
+        ocr_result = ocr.run(path)
+        ocr_id = models.record_ocr(capture_id, ocr_result)
+
+        # Assign
+        decision = assign_srv.decide(ocr_result["text"])
+        assignment_id = models.record_assignment(ocr_id, decision)
+
+        # Plan + queue (do not execute by default)
+        gcode = motion.plan_for(assignment_id)
+        move_id = models.enqueue_move(assignment_id, gcode)
+
+        payload = {
+            "capture_id": capture_id,
+            "ocr_id": ocr_id,
+            "assignment_id": assignment_id,
+            "move_id": move_id,
+            "text": ocr_result["text"],
+            "confidence": ocr_result["confidence"],
+            "slot_id": decision.get("slot_id"),
+            "rule_used": decision.get("rule_used"),
+            "gcode": gcode,
+        }
+        await ws_manager.broadcast({"event": "sort", **payload})
+        return payload
+    except Exception as e:
+        logger.exception("Sort pipeline failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ======================================================================
-# Dev entry point (optional)
+# Dev entry point
 # ======================================================================
 
 if __name__ == "__main__":
@@ -501,5 +570,5 @@ if __name__ == "__main__":
         "app.main:app",
         host=CONFIG.server.get("host", "0.0.0.0"),
         port=int(CONFIG.server.get("port", 8000)),
-        reload=bool(os.environ.get("RELOAD", "1") == "1"),
+        reload=True,
     )
