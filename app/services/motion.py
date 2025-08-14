@@ -174,28 +174,43 @@ def execute(move_id: int) -> Dict[str, Any]:
 def _normalize_slot(asg: Dict[str, Any]) -> Dict[str, Any]:
     """
     Accept a variety of assignment payloads and return a slot dict with any of:
-      - 'x_mm','y_mm'
-      - 'row','col'
-      - 'slot_id'
+      - {'x_mm': float, 'y_mm': float}
+      - {'row': int, 'col': int}
+      - {'slot_id': int}
+    None values are treated as missing.
     """
-    # Already has explicit coordinates
-    if "x_mm" in asg and "y_mm" in asg:
-        return {"x_mm": float(asg["x_mm"]), "y_mm": float(asg["y_mm"])}
+    def _has_xy(d: Dict[str, Any]) -> bool:
+        return d.get("x_mm") is not None and d.get("y_mm") is not None
 
-    # Has row/col
-    if "row" in asg and "col" in asg:
-        return {"row": int(asg["row"]), "col": int(asg["col"])}
+    def _has_rc(d: Dict[str, Any]) -> bool:
+        return d.get("row") is not None and d.get("col") is not None
 
-    # Only a slot_id (typical for first_letter / csv lookup)
-    if "slot_id" in asg and asg["slot_id"] is not None:
-        return {"slot_id": int(asg["slot_id"])}
+    # Prefer explicit coordinates if both are non-null
+    if _has_xy(asg):
+        try:
+            return {"x_mm": float(asg["x_mm"]), "y_mm": float(asg["y_mm"])}
+        except (TypeError, ValueError):
+            pass  # fall through
 
-    # Try models.get_slot(slot_id) if assignment points to a slot row id
+    # Next prefer row/col if both are non-null
+    if _has_rc(asg):
+        try:
+            return {"row": int(asg["row"]), "col": int(asg["col"])}
+        except (TypeError, ValueError):
+            pass  # fall through
+
+    # Finally allow slot_id
     sid = asg.get("slot_id")
     if sid is not None:
-        return {"slot_id": int(sid)}
+        try:
+            return {"slot_id": int(sid)}
+        except (TypeError, ValueError):
+            pass
 
-    raise ValueError("Assignment does not contain slot information")
+    raise ValueError(
+        "Assignment does not contain usable slot info; need (x_mm & y_mm) or (row & col) or slot_id"
+    )
+
 
 
 def _resolve_slot_pose(slot: Dict[str, Any]) -> Tuple[float, float, float, float, float]:
