@@ -1,86 +1,365 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>Card Sorter Control</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <!-- Bootstrap CSS for quick styling -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
-    <style>
-        body { background-color: #f8f9fa; }
-        .camera-feed {
-            border: 2px solid #ddd;
-            border-radius: 8px;
-            max-width: 100%;
-        }
-        .btn-action {
-            min-width: 120px;
-        }
-    </style>
+  <meta charset="utf-8">
+  <title>{{ app_name }} {{ version }}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      --bg: #101316;
+      --panel: #151a1f;
+      --panel-2: #0f1317;
+      --text: #e7edf3;
+      --muted: #9db0bf;
+      --accent: #22aaff;
+      --ok: #48c774;
+      --warn: #ffbf47;
+      --err: #ff6b6b;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      --sans: system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, "Helvetica Neue", Arial, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans);
+      display: grid; grid-template-rows: auto 1fr auto; gap: 8px;
+    }
+    header, footer { padding: 12px 16px; background: var(--panel); }
+    header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+    header small { color: var(--muted); }
+    main { padding: 12px 16px; display: grid; gap: 12px; grid-template-columns: 420px 1fr; }
+    .card { background: var(--panel); border: 1px solid #20262c; border-radius: 10px; overflow: hidden; }
+    .card h2 { margin: 0; padding: 10px 12px; font-size: 14px; border-bottom: 1px solid #20262c; background: var(--panel-2); }
+    .card .content { padding: 12px; }
+    .flex { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .grid { display: grid; gap: 8px; }
+    .btn {
+      appearance: none; border: 1px solid #2a3036; background: #1a2127; color: var(--text);
+      padding: 8px 12px; border-radius: 8px; cursor: pointer; font-weight: 600;
+    }
+    .btn:hover { border-color: #3a424a; background: #1e252c; }
+    .btn.primary { background: #163347; border-color: #255977; color: #cfefff; }
+    .btn.primary:hover { background: #173a52; }
+    .btn.warn { background: #3b2a12; border-color: #6e4e1b; color: #ffdea6; }
+    .btn.ok { background: #183524; border-color: #2f6b45; color: #bff3d3; }
+    .status-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; margin-right: 6px; vertical-align: middle; }
+    .ok { background: var(--ok); }
+    .bad { background: var(--err); }
+    .muted { color: var(--muted); }
+    .mono { font-family: var(--mono); font-size: 12px; line-height: 1.4; white-space: pre-wrap; }
+    .img-wrap { width: 100%; background: #0a0d10; border: 1px solid #1e242a; border-radius: 8px; overflow: hidden; }
+    .img-wrap img { display: block; width: 100%; height: auto; }
+    .kv { display: grid; grid-template-columns: 120px 1fr; gap: 6px 10px; }
+    .kv div:nth-child(odd) { color: var(--muted); }
+    .field { display: grid; gap: 6px; }
+    input[type="text"], textarea {
+      width: 100%; padding: 8px 10px; background: #0f1317; border: 1px solid #20262c; color: var(--text);
+      border-radius: 6px; font-family: var(--mono);
+    }
+    textarea { min-height: 120px; resize: vertical; }
+    .stack { display: grid; gap: 8px; }
+  </style>
 </head>
 <body>
-<div class="container py-4">
-    <h1 class="mb-4 text-center">📷 Card Sorter Control Panel</h1>
+<header>
+  <h1>{{ app_name }} <small class="muted">v{{ version }}</small></h1>
+</header>
 
-    <div class="row mb-4">
-        <div class="col text-center">
-            <h5>Live Camera Feed</h5>
-            <!-- Replace /camera/stream with your actual camera endpoint -->
-            <img id="camera" class="camera-feed" src="/camera/stream" alt="Camera preview">
-        </div>
+<main>
+  <!-- Left: live preview + actions -->
+  <section class="card">
+    <h2>Camera & Actions</h2>
+    <div class="content grid">
+      <div class="img-wrap">
+        <img id="stream" src="/camera/stream" alt="Live camera stream">
+      </div>
+
+      <div class="flex">
+        <button id="btnCapture" class="btn primary">Capture</button>
+        <button id="btnOCR" class="btn">OCR Last Capture</button>
+        <button id="btnCaptureOCR" class="btn">Capture + OCR</button>
+        <button id="btnSort" class="btn ok">Capture + OCR + Assign + Plan</button>
+      </div>
+
+      <div class="kv">
+        <div>Last image:</div><div class="mono" id="lastPath">–</div>
+        <div>Capture ID:</div><div class="mono" id="lastCaptureId">–</div>
+        <div>OCR ID:</div><div class="mono" id="lastOcrId">–</div>
+        <div>Assignment ID:</div><div class="mono" id="lastAssignId">–</div>
+        <div>Move ID:</div><div class="mono" id="lastMoveId">–</div>
+      </div>
     </div>
+  </section>
 
-    <div class="row g-3 mb-4">
-        <div class="col text-center">
-            <button id="btnCapture" class="btn btn-primary btn-action">📸 Capture & OCR</button>
-        </div>
-        <div class="col text-center">
-            <button id="btnSort" class="btn btn-success btn-action">🔄 Sort Card</button>
-        </div>
+  <!-- Right: OCR output + log -->
+  <section class="card">
+    <h2>Status & OCR Output</h2>
+    <div class="content grid">
+      <div class="flex">
+        <span><span id="stCamera" class="status-dot bad"></span>Camera</span>
+        <span><span id="stOCR" class="status-dot bad"></span>OCR</span>
+        <span><span id="stDB" class="status-dot bad"></span>DB</span>
+        <span><span id="stMotion" class="status-dot bad"></span>Motion</span>
+      </div>
+
+      <div class="field">
+        <label class="muted">Detected Text (from OCR)</label>
+        <pre id="ocrText" class="mono">–</pre>
+      </div>
+
+      <div class="field">
+        <label class="muted">Confidence</label>
+        <pre id="ocrConf" class="mono">–</pre>
+      </div>
+
+      <div class="field">
+        <label class="muted">Console Log</label>
+        <textarea id="log" readonly></textarea>
+      </div>
     </div>
+  </section>
 
-    <div class="row g-3">
-        <div class="col text-center">
-            <h5>Plunger Control</h5>
-            <div class="d-flex justify-content-center gap-2">
-                <button class="btn btn-warning btn-action" onclick="jogPlunger(-100)">⬅ Back</button>
-                <button class="btn btn-warning btn-action" onclick="jogPlunger(100)">Forward ➡</button>
-            </div>
-        </div>
+  <!-- Optional: Raw G-code sender -->
+  <section class="card" style="grid-column: 1 / span 2;">
+    <h2>Motion • Diagnostics</h2>
+    <div class="content grid">
+      <div class="flex">
+        <button id="btnPorts" class="btn">List Ports</button>
+        <button id="btnEnable" class="btn ok">Enable Motion</button>
+        <button id="btnDisable" class="btn warn">Disable Motion</button>
+        <button id="btnPing" class="btn">Ping (M115)</button>
+        <button id="btnHome" class="btn">Home</button>
+        <button id="btnTestSq" class="btn">Test Square 20mm</button>
+      </div>
+
+      <div class="field">
+        <label class="muted">Send Raw G-code (one per line)</label>
+        <textarea id="gcodeInput" placeholder="M114
+G90
+G0 X10 Y10 F2000
+M400"></textarea>
+        <button id="btnSend" class="btn primary">Send G-code</button>
+      </div>
     </div>
+  </section>
+</main>
 
-    <div class="mt-4">
-        <h5>Output Log</h5>
-        <pre id="log" style="background:#222; color:#0f0; padding:1rem; height:200px; overflow:auto;"></pre>
-    </div>
-</div>
+<footer>
+  <span class="muted">© Card Sorter</span>
+</footer>
 
-<!-- Bootstrap JS + dependencies -->
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 <script>
-    function logMessage(msg) {
-        const log = document.getElementById('log');
-        log.textContent += msg + "\\n";
-        log.scrollTop = log.scrollHeight;
+  // ----------------------------
+  // Helpers
+  // ----------------------------
+  async function api(url, opts) {
+    const res = await fetch(url, opts);
+    if (!res.ok) {
+      const msg = await res.text().catch(()=>'');
+      throw new Error(`${res.status}: ${msg || res.statusText}`);
     }
+    const ct = res.headers.get('content-type') || '';
+    if (ct.includes('application/json')) return res.json();
+    return res.text();
+  }
 
-    document.getElementById('btnCapture').addEventListener('click', async () => {
-        logMessage("Capturing image for OCR...");
-        const resp = await fetch('/camera/capture');
-        logMessage(await resp.text());
-    });
+  function logMessage(msg) {
+    const el = document.getElementById('log');
+    const line = (typeof msg === 'string') ? msg : JSON.stringify(msg, null, 2);
+    el.value += (el.value ? '\n' : '') + line;
+    el.scrollTop = el.scrollHeight;
+  }
 
-    document.getElementById('btnSort').addEventListener('click', async () => {
-        logMessage("Sorting card...");
-        const resp = await fetch('/sort', { method: 'POST' });
-        logMessage(await resp.text());
-    });
+  function setDot(id, ok) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.classList.toggle('ok', !!ok);
+    el.classList.toggle('bad', !ok);
+  }
 
-    async function jogPlunger(steps) {
-        logMessage(`Jogging plunger by ${steps} steps...`);
-        const resp = await fetch(`/plunger/jog?steps=${steps}`, { method: 'POST' });
-        logMessage(await resp.text());
+  // ----------------------------
+  // Status via WebSocket
+  // ----------------------------
+  (function initWS(){
+    try {
+      const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/status');
+      ws.onmessage = ev => {
+        try {
+          const s = JSON.parse(ev.data);
+          setDot('stCamera', !!s.camera);
+          setDot('stOCR', !!s.ocr);
+          setDot('stDB', !!s.db_ok);
+          setDot('stMotion', !!s.motion_enabled);
+        } catch (e) {}
+      };
+      ws.onclose = () => setTimeout(initWS, 3000);
+    } catch (e) { setTimeout(initWS, 3000); }
+  })();
+
+  // ----------------------------
+  // State
+  // ----------------------------
+  let lastCaptureId = null;
+  let lastOcrId = null;
+  let lastAssignId = null;
+  let lastMoveId = null;
+
+  function updateIds() {
+    document.getElementById('lastCaptureId').textContent = lastCaptureId ?? '–';
+    document.getElementById('lastOcrId').textContent = lastOcrId ?? '–';
+    document.getElementById('lastAssignId').textContent = lastAssignId ?? '–';
+    document.getElementById('lastMoveId').textContent = lastMoveId ?? '–';
+  }
+
+  // ----------------------------
+  // Buttons: Capture / OCR / Sort
+  // ----------------------------
+  document.getElementById('btnCapture').addEventListener('click', async () => {
+    try {
+      logMessage('Capturing…');
+      const cap = await api('/camera/capture');
+      lastCaptureId = cap.capture_id;
+      document.getElementById('lastPath').textContent = cap.path;
+      updateIds();
+      logMessage({capture: cap});
+    } catch (e) {
+      logMessage('Capture error: ' + e.message);
     }
+  });
+
+  document.getElementById('btnOCR').addEventListener('click', async () => {
+    try {
+      if (!lastCaptureId) throw new Error('No capture yet. Press Capture first.');
+      logMessage('Running OCR on capture_id=' + lastCaptureId);
+      const res = await api(`/ocr/${lastCaptureId}`, { method: 'POST' });
+      lastOcrId = res.ocr_id;
+      updateIds();
+      // Explicitly show OCR text & confidence
+      document.getElementById('ocrText').textContent = res.text || '—';
+      document.getElementById('ocrConf').textContent = String(res.confidence ?? '–');
+      logMessage({ocr: res});
+    } catch (e) {
+      logMessage('OCR error: ' + e.message);
+    }
+  });
+
+  document.getElementById('btnCaptureOCR').addEventListener('click', async () => {
+    try {
+      logMessage('Capture + OCR…');
+      const cap = await api('/camera/capture');
+      lastCaptureId = cap.capture_id;
+      document.getElementById('lastPath').textContent = cap.path;
+      updateIds();
+
+      const res = await api(`/ocr/${lastCaptureId}`, { method: 'POST' });
+      lastOcrId = res.ocr_id;
+      updateIds();
+      document.getElementById('ocrText').textContent = res.text || '—';
+      document.getElementById('ocrConf').textContent = String(res.confidence ?? '–');
+
+      logMessage({capture: cap, ocr: res});
+    } catch (e) {
+      logMessage('Capture+OCR error: ' + e.message);
+    }
+  });
+
+  document.getElementById('btnSort').addEventListener('click', async () => {
+    try {
+      logMessage('Pipeline: capture → ocr → assign → plan (queue)…');
+      const res = await api('/sort', { method: 'POST' });
+      lastCaptureId = res.capture_id;
+      lastOcrId = res.ocr_id;
+      lastAssignId = res.assignment_id;
+      lastMoveId = res.move_id;
+      updateIds();
+
+      // Surface OCR text/confidence for visibility
+      document.getElementById('ocrText').textContent = res.text || '—';
+      document.getElementById('ocrConf').textContent = String(res.confidence ?? '–');
+
+      // Also show path from the latest capture id (optional: requires an extra fetch if you want the path)
+      // document.getElementById('lastPath').textContent = '(see captures list)';
+
+      logMessage(res);
+    } catch (e) {
+      logMessage('Sort error: ' + e.message);
+    }
+  });
+
+  // ----------------------------
+  // Diagnostics / Motion
+  // ----------------------------
+  document.getElementById('btnPorts').addEventListener('click', async () => {
+    try {
+      const res = await api('/motion/ports');
+      logMessage(res);
+    } catch (e) {
+      logMessage('Ports error: ' + e.message);
+    }
+  });
+
+  document.getElementById('btnEnable').addEventListener('click', async () => {
+    try {
+      const res = await api('/motion/enable', { method: 'POST' });
+      logMessage(res);
+    } catch (e) {
+      logMessage('Enable error: ' + e.message);
+    }
+  });
+
+  document.getElementById('btnDisable').addEventListener('click', async () => {
+    try {
+      const res = await api('/motion/disable', { method: 'POST' });
+      logMessage(res);
+    } catch (e) {
+      logMessage('Disable error: ' + e.message);
+    }
+  });
+
+  document.getElementById('btnPing').addEventListener('click', async () => {
+    try {
+      const res = await api('/motion/ping');
+      logMessage(res);
+    } catch (e) {
+      logMessage('Ping error: ' + e.message);
+    }
+  });
+
+  document.getElementById('btnHome').addEventListener('click', async () => {
+    try {
+      const res = await api('/motion/home', { method: 'POST' });
+      logMessage(res);
+    } catch (e) {
+      logMessage('Home error: ' + e.message);
+    }
+  });
+
+  document.getElementById('btnTestSq').addEventListener('click', async () => {
+    try {
+      const res = await api('/motion/test-square?size_mm=20&feed_xy=1200', { method: 'POST' });
+      logMessage(res);
+    } catch (e) {
+      logMessage('Test square error: ' + e.message);
+    }
+  });
+
+  document.getElementById('btnSend').addEventListener('click', async () => {
+    try {
+      const lines = document.getElementById('gcodeInput').value
+        .split('\n')
+        .map(s => s.trim())
+        .filter(Boolean);
+      const res = await api('/motion/send', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ gcode: lines })
+      });
+      logMessage(res);
+    } catch (e) {
+      logMessage('Send error: ' + e.message);
+    }
+  });
+
 </script>
 </body>
 </html>
