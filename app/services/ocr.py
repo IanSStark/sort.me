@@ -325,3 +325,21 @@ def _estimate_confidence(text: str) -> int:
     base = 30 + int(65 * ratio)
     length_bonus = min(10, int(math.log10(max(10, len(t))) * 8))
     return int(max(0, min(100, base + length_bonus)))
+
+import pytesseract
+import logging
+from PIL import Image
+
+logger = logging.getLogger("ocr")
+
+def run_ocr(image_path: str) -> str:
+    """Run OCR on the given image and return the detected text."""
+    try:
+        img = Image.open(image_path)
+        text = pytesseract.image_to_string(img, lang="eng", config="--psm 6")
+        logger.info(f"[OCR] Detected text: {text.strip()}")
+        return text.strip()
+    except Exception as e:
+        logger.exception(f"OCR failed: {e}")
+        return ""
+
