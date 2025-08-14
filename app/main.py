@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import yaml
 from fastapi import (
     BackgroundTasks,
+    Body,
     FastAPI,
     HTTPException,
     Path as FPath,
@@ -38,7 +39,7 @@ from app import models
 from app.services import camera, ocr, assign as assign_srv, motion, plunger
 
 APP_NAME = "Card Sorter"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 
 # ======================================================================
 # Config models
@@ -85,7 +86,7 @@ class AssignmentConfig(BaseModel):
     mode: str = "first_letter"            # or "csv_lookup"
     slots_csv: Optional[str] = None
     default_slot: Optional[int] = None
-    first_letter_groups: Dict[str, int] = Field(default_factory=dict)
+    first_letter_groups: Optional[Dict[str, int]] = None  # allow null
 
 
 class PlungerConfig(BaseModel):
@@ -237,7 +238,7 @@ async def on_startup() -> None:
         "mode": CONFIG.assignment.mode,
         "default_slot": CONFIG.assignment.default_slot,
         "slots_csv": CONFIG.assignment.slots_csv,
-        "first_letter_groups": CONFIG.assignment.first_letter_groups,
+        "first_letter_groups": CONFIG.assignment.first_letter_groups or {},
     })
     motion.init(cfg={
         "port": CONFIG.motion.port,
@@ -408,7 +409,7 @@ async def assign_slot(ocr_id: int = FPath(..., ge=1)) -> AssignmentResponse:
     await ws_manager.broadcast({"event": "assign", "assignment_id": assignment_id})
     return AssignmentResponse(assignment_id=assignment_id, **decision)
 
-# ---- Motion ----
+# ---- Motion: planning / queue / execute ----
 
 @app.post("/motion/plan/{assignment_id}", response_model=MovePlanResponse)
 async def motion_plan(assignment_id: int = FPath(..., ge=1)) -> MovePlanResponse:
@@ -462,21 +463,68 @@ async def motion_disable() -> ToggleResponse:
         logger.exception("Disable motion failed")
         return ToggleResponse(ok=False, error=str(e))
 
-# ---- Plunger ----
+# ---- Motion: new diagnostics / raw send ----
 
-@app.post("/plunger/jog")
-async def plunger_jog(
-    steps: int = Query(..., ge=-1_000_000, le=1_000_000),
-    enable: bool = Query(True),
-    delay_us: int = Query(1200, ge=100, le=20000),
+@app.get("/motion/ports")
+async def motion_ports():
+    return {"ports": motion.list_ports()}
+
+@app.get("/motion/ping")
+async def motion_ping():
+    res = motion.ping()
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("error", "ping failed"))
+    return res
+
+@app.post("/motion/home")
+async def motion_home():
+    res = motion.home_now()
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("error", "home failed"))
+    await ws_manager.broadcast({"event": "motion_home"})
+    return res
+
+@app.post("/motion/send")
+async def motion_send(body: dict = Body(...)):
+    """
+    Body example: {"gcode": ["M115", "G0 X10 Y10 F3000", "M400"]}
+    """
+    gcode = body.get("gcode") or body.get("lines")
+    if not isinstance(gcode, list):
+        raise HTTPException(status_code=422, detail="Body must include list 'gcode'")
+    res = motion.send_raw([str(x) for x in gcode])
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("error", "send failed"))
+    await ws_manager.broadcast({"event": "motion_send", "count": res.get("sent", 0)})
+    return res
+
+@app.post("/motion/test-square")
+async def motion_test_square(
+    size_mm: float = Query(20.0, gt=0),
+    feed_xy: int = Query(1200, gt=0),
 ):
-    try:
-        res = plunger.jog(steps=steps, enable=enable, delay_us=delay_us)
-        await ws_manager.broadcast({"event": "plunger", "steps": steps})
-        return {"ok": True, "result": res}
-    except Exception as e:
-        logger.exception("Plunger jog failed")
-        raise HTTPException(status_code=400, detail=str(e))
+    """
+    Draw a small square in XY at current Z (no Z moves); controller must be homed or in a safe state.
+    """
+    if not motion.enabled():
+        raise HTTPException(status_code=400, detail="Motion is disabled")
+    lines = [
+        "G90",
+        f"G1 F{feed_xy}",
+        "M400",
+        "G4 P50",
+        "G1 X0 Y0",
+        f"G1 X{size_mm} Y0",
+        f"G1 X{size_mm} Y{size_mm}",
+        f"G1 X0 Y{size_mm}",
+        "G1 X0 Y0",
+        "M400",
+    ]
+    res = motion.send_raw(lines)
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("error", "send failed"))
+    await ws_manager.broadcast({"event": "motion_test_square", "size": size_mm})
+    return res
 
 # ---- Camera helpers ----
 
