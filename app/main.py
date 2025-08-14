@@ -372,6 +372,11 @@ async def get_capture(capture_id: int = FPath(..., ge=1)):
     if not row:
         raise HTTPException(status_code=404, detail="Capture not found")
     return row
+    @app.get("/ocr")
+def ocr_endpoint():
+    image_path = camera.capture_image()
+    detected_text = ocr.run_ocr(image_path)
+    return {"image": image_path, "text": detected_text}
 
 @app.post("/capture", response_model=CaptureResponse)
 async def do_capture(background_tasks: BackgroundTasks) -> CaptureResponse:
