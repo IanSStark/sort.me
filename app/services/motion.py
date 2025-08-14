@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("motion")
@@ -27,12 +27,12 @@ class State:
     port: str = "/dev/ttyACM0"
     baud: int = 250000
     enabled: bool = False
-    homing_sequence: List[str] = None
+    homing_sequence: List[str] = field(default_factory=lambda: ["G28"])
     feed_xy: int = 3000
     feed_z: int = 600
-    grid: GridConfig = GridConfig()
+    grid: GridConfig = field(default_factory=GridConfig)
 
-_state = State(homing_sequence=["G28"])
+_state = State()
 
 # Serial backend (optional, only if enabled)
 _ser = None  # pyserial Serial
@@ -62,21 +62,33 @@ def init(cfg: Dict[str, Any]) -> None:
     _state.baud = int(cfg.get("baud", _state.baud))
     _state.enabled = bool(cfg.get("enabled", _state.enabled))
 
+    # Homing sequence (list)
+    hs = cfg.get("homing_sequence")
+    if isinstance(hs, list) and hs:
+        _state.homing_sequence = [str(cmd) for cmd in hs]
+
+    # Feedrates
     fr = cfg.get("feedrates", {}) or {}
     _state.feed_xy = int(fr.get("xy", _state.feed_xy))
     _state.feed_z = int(fr.get("z", _state.feed_z))
 
+    # Grid
     g = cfg.get("grid", {}) or {}
     z = g.get("z", {}) or {}
-    _state.grid = GridConfig(
-        origin_mm=tuple(g.get("origin_mm", _state.grid.origin_mm)),   # type: ignore[arg-type]
-        pitch_mm=tuple(g.get("pitch_mm", _state.grid.pitch_mm)),      # type: ignore[arg-type]
-        rows=int(g.get("rows", _state.grid.rows)),
-        cols=int(g.get("cols", _state.grid.cols)),
-        z_pick=float(z.get("pick", _state.grid.z_pick)),
-        z_travel=float(z.get("travel", _state.grid.z_travel)),
-        z_safe=float(z.get("safe", _state.grid.z_safe)),
-    )
+    try:
+        origin = tuple(g.get("origin_mm", _state.grid.origin_mm))  # type: ignore[arg-type]
+        pitch = tuple(g.get("pitch_mm", _state.grid.pitch_mm))     # type: ignore[arg-type]
+        _state.grid = GridConfig(
+            origin_mm=(float(origin[0]), float(origin[1])),
+            pitch_mm=(float(pitch[0]), float(pitch[1])),
+            rows=int(g.get("rows", _state.grid.rows)),
+            cols=int(g.get("cols", _state.grid.cols)),
+            z_pick=float(z.get("pick", _state.grid.z_pick)),
+            z_travel=float(z.get("travel", _state.grid.z_travel)),
+            z_safe=float(z.get("safe", _state.grid.z_safe)),
+        )
+    except Exception as e:
+        logger.warning("Invalid grid config; using defaults: %s", e)
 
     logger.info(
         "Motion init: port=%s baud=%s enabled=%s feed_xy=%s feed_z=%s grid=%s",
@@ -227,7 +239,6 @@ def _resolve_slot_pose(slot: Dict[str, Any]) -> Tuple[float, float, float, float
 
     raise ValueError("Slot must provide either (x_mm,y_mm), (row,col), or (slot_id)")
 
-
 # =========================
 # G-code generation
 # =========================
@@ -249,7 +260,6 @@ def _gcode_to_slot(pose: Tuple[float, float, float, float, float]) -> List[str]:
     g.append(f"G1 Z{z_pick:.3f} F{fz}")                   # pick/deposit level
     g.append(f"G0 Z{z_safe:.3f} F{fz}")                   # retract
     return g
-
 
 # =========================
 # Serial I/O (optional)
@@ -297,7 +307,6 @@ def _send_gcode(lines: List[str]) -> None:
         cmd = (line.strip() + "\n").encode()
         _ser.write(cmd)
         _ser.flush()
-        # naive 'ok' wait; adjust per firmware if needed
         _read_until_ok()
 
 def _read_until_ok() -> None:
