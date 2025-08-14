@@ -1,6 +1,7 @@
 # app/services/motion.py
 from __future__ import annotations
 
+import glob
 import logging
 import time
 from dataclasses import dataclass, field
@@ -126,10 +127,25 @@ def port_or_none() -> Optional[str]:
     return _state.port if _state.enabled else None
 
 
+def list_ports() -> List[str]:
+    """Return likely serial device paths for controllers."""
+    candidates: List[str] = []
+    for pat in ("/dev/ttyACM*", "/dev/ttyUSB*", "/dev/serial/by-id/*"):
+        candidates.extend(sorted(glob.glob(pat)))
+    # Deduplicate while preserving order
+    seen = set()
+    out: List[str] = []
+    for p in candidates:
+        if p not in seen:
+            out.append(p)
+            seen.add(p)
+    return out
+
+
 def plan_for(assignment_id: int) -> List[str]:
     """
     Build G-code for a given assignment.
-    Expects models.get_assignment(assignment_id) to return a dict like:
+    Expects models.get_assignment(assignment_id) -> dict like:
       {"slot_id": 7, "row": 0, "col": 6, "x_mm": 140.0, "y_mm": 95.0, ...}
     Only one of (x_mm,y_mm), (row,col), or slot_id is required; we resolve the rest.
     """
@@ -165,6 +181,55 @@ def execute(move_id: int) -> Dict[str, Any]:
         return {"ok": True, "sent": len(gcode)}
     except Exception as e:
         logger.exception("Execute failed")
+        return {"ok": False, "error": str(e)}
+
+
+def send_raw(lines: List[str]) -> Dict[str, Any]:
+    """Send arbitrary G-code lines. Requires motion enabled/open serial."""
+    if not _state.enabled:
+        return {"ok": False, "error": "Motion is disabled"}
+    if _ser is None:
+        return {"ok": False, "error": "Serial not open"}
+
+    payload: List[str] = []
+    for ln in lines:
+        s = (ln or "").strip()
+        if not s:
+            continue
+        if s.startswith(";"):
+            continue
+        s = s.split(";", 1)[0].strip()
+        if s:
+            payload.append(s)
+
+    if not payload:
+        return {"ok": False, "error": "No G-code to send"}
+
+    _send_gcode(payload)
+    return {"ok": True, "sent": len(payload), "lines": payload}
+
+
+def ping() -> Dict[str, Any]:
+    """Query firmware info (M115)."""
+    if not _state.enabled or _ser is None:
+        return {"ok": False, "error": "Motion disabled or serial not open"}
+    try:
+        _send_gcode(["M115"])
+        return {"ok": True}
+    except Exception as e:
+        logger.exception("Ping failed")
+        return {"ok": False, "error": str(e)}
+
+
+def home_now() -> Dict[str, Any]:
+    """Run the configured homing sequence immediately."""
+    if not _state.enabled or _ser is None:
+        return {"ok": False, "error": "Motion disabled or serial not open"}
+    try:
+        _run_homing()
+        return {"ok": True}
+    except Exception as e:
+        logger.exception("Homing failed")
         return {"ok": False, "error": str(e)}
 
 # =========================
@@ -210,7 +275,6 @@ def _normalize_slot(asg: Dict[str, Any]) -> Dict[str, Any]:
     raise ValueError(
         "Assignment does not contain usable slot info; need (x_mm & y_mm) or (row & col) or slot_id"
     )
-
 
 
 def _resolve_slot_pose(slot: Dict[str, Any]) -> Tuple[float, float, float, float, float]:
