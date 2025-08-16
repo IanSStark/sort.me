@@ -20,9 +20,12 @@ from app.services import camera, ocr, motion
 import logging
 logger = logging.getLogger("uvicorn.error")  # or your preferred logger
 
-from app.services import grid as grid_svc
-from app.services import motion
-from app import models, assign   # you already use these elsewhere
+# app/main.py
+from . import models
+from .services import assign, camera, grid as grid_svc, motion, plunger
+# if you have an OCR module:
+from .services import ocr  # only if services/ocr.py exists
+
 
 GRID: grid_svc.Grid | None = None
 
