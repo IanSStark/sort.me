@@ -1,404 +1,315 @@
 # app/services/motion.py
 from __future__ import annotations
 
-import glob
 import logging
+import threading
 import time
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+import serial  # pyserial
+import serial.tools.list_ports
 
 logger = logging.getLogger("motion")
 
-# =========================
-# Types / State
-# =========================
+# =========
+# Config
+# =========
 
 @dataclass
-class GridConfig:
-    origin_mm: Tuple[float, float] = (0.0, 0.0)     # (x0, y0)
-    pitch_mm: Tuple[float, float] = (70.0, 95.0)    # (dx, dy)
-    rows: int = 5
-    cols: int = 10
-    z_pick: float = -2.0
-    z_travel: float = 15.0
-    z_safe: float = 20.0
-
-@dataclass
-class State:
+class MotionConfig:
     port: str = "/dev/ttyACM0"
     baud: int = 250000
     enabled: bool = False
-    homing_sequence: List[str] = field(default_factory=lambda: ["G28"])
-    feed_xy: int = 3000
-    feed_z: int = 600
-    grid: GridConfig = field(default_factory=GridConfig)
 
-_state = State()
+    # Serial behavior
+    read_timeout_s: float = 2.0
+    write_timeout_s: float = 2.0
+    connect_timeout_s: float = 6.0
+    reset_on_connect: bool = True          # toggle DTR/RTS to reset the board
+    startup_drain_s: float = 2.0           # time to drain boot banner after reset
 
-# Serial backend (optional, only if enabled)
-_ser = None  # pyserial Serial
+    # Protocol parsing (Marlin-like)
+    ok_tokens: tuple = ("ok",)             # lines containing these tokens signal success
+    error_tokens: tuple = ("error", "Error:")  # signals failure
+    busy_tokens: tuple = ("busy:", "wait")     # informational; do not fail
 
-# =========================
-# Public API
-# =========================
+# =========
+# State
+# =========
+
+_serial_lock = threading.RLock()
+_ser: Optional[serial.Serial] = None
+_cfg = MotionConfig()
+_initialized = False
+
+# =========
+# Public API expected by main.py / UI
+# =========
 
 def init(cfg: Dict[str, Any]) -> None:
     """
-    cfg = {
-      "port": "/dev/ttyACM0",
-      "baud": 250000,
-      "enabled": False,
-      "homing_sequence": ["G28"],
-      "feedrates": {"xy": 3000, "z": 600},
-      "grid": {
-          "origin_mm": [x0, y0],
-          "pitch_mm": [dx, dy],
-          "rows": R, "cols": C,
-          "z": {"pick": -2.0, "travel": 15.0, "safe": 20.0}
-      }
-    }
+    Initialize motion service using config.yaml values.
+    Does not open the port yet; call connect()/enable() when ready.
     """
-    global _state
-    _state.port = str(cfg.get("port", _state.port))
-    _state.baud = int(cfg.get("baud", _state.baud))
-    _state.enabled = bool(cfg.get("enabled", _state.enabled))
-
-    # Homing sequence (list)
-    hs = cfg.get("homing_sequence")
-    if isinstance(hs, list) and hs:
-        _state.homing_sequence = [str(cmd) for cmd in hs]
-
-    # Feedrates
-    fr = cfg.get("feedrates", {}) or {}
-    _state.feed_xy = int(fr.get("xy", _state.feed_xy))
-    _state.feed_z = int(fr.get("z", _state.feed_z))
-
-    # Grid
-    g = cfg.get("grid", {}) or {}
-    z = g.get("z", {}) or {}
-    try:
-        origin = tuple(g.get("origin_mm", _state.grid.origin_mm))  # type: ignore[arg-type]
-        pitch = tuple(g.get("pitch_mm", _state.grid.pitch_mm))     # type: ignore[arg-type]
-        _state.grid = GridConfig(
-            origin_mm=(float(origin[0]), float(origin[1])),
-            pitch_mm=(float(pitch[0]), float(pitch[1])),
-            rows=int(g.get("rows", _state.grid.rows)),
-            cols=int(g.get("cols", _state.grid.cols)),
-            z_pick=float(z.get("pick", _state.grid.z_pick)),
-            z_travel=float(z.get("travel", _state.grid.z_travel)),
-            z_safe=float(z.get("safe", _state.grid.z_safe)),
-        )
-    except Exception as e:
-        logger.warning("Invalid grid config; using defaults: %s", e)
-
+    global _cfg, _initialized
+    _cfg = MotionConfig(
+        port=str(cfg.get("port", _cfg.port)),
+        baud=int(cfg.get("baud", _cfg.baud)),
+        enabled=bool(cfg.get("enabled", _cfg.enabled)),
+        read_timeout_s=float(cfg.get("read_timeout_s", _cfg.read_timeout_s)),
+        write_timeout_s=float(cfg.get("write_timeout_s", _cfg.write_timeout_s)),
+        connect_timeout_s=float(cfg.get("connect_timeout_s", _cfg.connect_timeout_s)),
+        reset_on_connect=bool(cfg.get("reset_on_connect", _cfg.reset_on_connect)),
+        startup_drain_s=float(cfg.get("startup_drain_s", _cfg.startup_drain_s)),
+        ok_tokens=tuple(cfg.get("ok_tokens", list(_cfg.ok_tokens))),
+        error_tokens=tuple(cfg.get("error_tokens", list(_cfg.error_tokens))),
+        busy_tokens=tuple(cfg.get("busy_tokens", list(_cfg.busy_tokens))),
+    )
+    _initialized = True
     logger.info(
-        "Motion init: port=%s baud=%s enabled=%s feed_xy=%s feed_z=%s grid=%s",
-        _state.port, _state.baud, _state.enabled, _state.feed_xy, _state.feed_z, _state.grid
+        "Motion init: port=%s baud=%d enabled=%s",
+        _cfg.port, _cfg.baud, _cfg.enabled
     )
 
-    if _state.enabled:
-        _open_serial()
-        _run_homing()
+def status() -> bool:
+    return bool(_initialized)
 
+def list_ports() -> List[Dict[str, str]]:
+    ports = []
+    for p in serial.tools.list_ports.comports():
+        ports.append({
+            "device": p.device,
+            "name": p.name or "",
+            "description": p.description or "",
+            "hwid": p.hwid or "",
+            "vid": f"{p.vid:04x}" if p.vid is not None else "",
+            "pid": f"{p.pid:04x}" if p.pid is not None else "",
+        })
+    return ports
 
-def shutdown() -> None:
-    _close_serial()
-    logger.info("Motion shutdown complete")
+def is_connected() -> bool:
+    with _serial_lock:
+        return _ser is not None and _ser.is_open
 
-
-def enabled() -> bool:
-    return _state.enabled
-
-
-def set_enabled(value: bool) -> bool:
-    """Turn motion I/O on/off. Planning works regardless; execution requires enabled=True."""
-    was = _state.enabled
-    if value and not was:
-        _state.enabled = True
-        _open_serial()
-        _run_homing()
-    elif not value and was:
-        _state.enabled = False
-        _close_serial()
-    return _state.enabled
-
-
-def port_or_none() -> Optional[str]:
-    return _state.port if _state.enabled else None
-
-
-def list_ports() -> List[str]:
-    """Return likely serial device paths for controllers."""
-    candidates: List[str] = []
-    for pat in ("/dev/ttyACM*", "/dev/ttyUSB*", "/dev/serial/by-id/*"):
-        candidates.extend(sorted(glob.glob(pat)))
-    # Deduplicate while preserving order
-    seen = set()
-    out: List[str] = []
-    for p in candidates:
-        if p not in seen:
-            out.append(p)
-            seen.add(p)
-    return out
-
-
-def plan_for(assignment_id: int) -> List[str]:
+def connect(port: Optional[str] = None, baud: Optional[int] = None) -> Dict[str, Any]:
     """
-    Build G-code for a given assignment.
-    Expects models.get_assignment(assignment_id) -> dict like:
-      {"slot_id": 7, "row": 0, "col": 6, "x_mm": 140.0, "y_mm": 95.0, ...}
-    Only one of (x_mm,y_mm), (row,col), or slot_id is required; we resolve the rest.
+    Open the serial port and drain the startup banner. Safe to call repeatedly.
     """
-    from app import models  # local import to avoid circulars
-    asg = models.get_assignment(assignment_id)
-    if not asg:
-        raise ValueError(f"Assignment {assignment_id} not found")
+    global _ser
+    prt = port or _cfg.port
+    bd = baud or _cfg.baud
 
-    slot = _normalize_slot(asg)
-    pose = _resolve_slot_pose(slot)  # (x_mm, y_mm, z_pick, z_travel, z_safe)
+    with _serial_lock:
+        # Already connected to the same port/baud
+        if _ser and _ser.is_open and _ser.port == prt and _ser.baudrate == bd:
+            return {"connected": True, "port": prt, "baud": bd, "already": True}
 
-    g = _gcode_to_slot(pose)
-    logger.debug("Planned G-code for assignment %s: %s", assignment_id, g)
-    return g
+        # Close any existing
+        try:
+            if _ser and _ser.is_open:
+                _ser.close()
+        except Exception:
+            pass
+        _ser = None
 
+        # Open new
+        logger.info("Opening serial: %s @ %d", prt, bd)
+        ser = serial.Serial()
+        ser.port = prt
+        ser.baudrate = bd
+        ser.timeout = _cfg.read_timeout_s
+        ser.write_timeout = _cfg.write_timeout_s
+        ser.dsrdtr = False
+        ser.rtscts = False
+        ser.xonxoff = False
 
-def execute(move_id: int) -> Dict[str, Any]:
+        ser.open()
+
+        # Toggle DTR/RTS to reset board if requested
+        if _cfg.reset_on_connect:
+            try:
+                ser.dtr = False
+                ser.rts = False
+                time.sleep(0.1)
+                ser.dtr = True
+                ser.rts = True
+            except Exception:
+                # Not all adapters support these lines; ignore
+                logger.debug("DTR/RTS toggle not supported", exc_info=True)
+
+        # Drain startup banner
+        t0 = time.time()
+        deadline = t0 + _cfg.connect_timeout_s
+        time.sleep(_cfg.startup_drain_s)
+        _drain_input(ser, deadline)
+
+        _ser = ser
+        return {"connected": True, "port": prt, "baud": bd, "already": False}
+
+def disconnect() -> Dict[str, Any]:
+    global _ser
+    with _serial_lock:
+        if _ser:
+            try:
+                _ser.close()
+            except Exception:
+                pass
+        _ser = None
+    return {"connected": False}
+
+def enable() -> Dict[str, Any]:
     """
-    Execute a queued move (gcode list) by move_id using models.get_move(move_id).
-    Requires motion to be enabled.
+    Ensure connected and mark enabled. Does NOT send machine-enable G-code.
     """
-    if not _state.enabled:
-        return {"ok": False, "error": "Motion is disabled"}
+    if not is_connected():
+        connect()
+    _cfg.enabled = True
+    return {"enabled": True, "port": _cfg.port, "baud": _cfg.baud}
 
-    from app import models
-    row = models.get_move(move_id)
-    if not row:
-        return {"ok": False, "error": f"Move {move_id} not found"}
-
-    gcode: List[str] = row["gcode"]
-    try:
-        _send_gcode(gcode)
-        return {"ok": True, "sent": len(gcode)}
-    except Exception as e:
-        logger.exception("Execute failed")
-        return {"ok": False, "error": str(e)}
-
-
-def send_raw(lines: List[str]) -> Dict[str, Any]:
-    """Send arbitrary G-code lines. Requires motion enabled/open serial."""
-    if not _state.enabled:
-        return {"ok": False, "error": "Motion is disabled"}
-    if _ser is None:
-        return {"ok": False, "error": "Serial not open"}
-
-    payload: List[str] = []
-    for ln in lines:
-        s = (ln or "").strip()
-        if not s:
-            continue
-        if s.startswith(";"):
-            continue
-        s = s.split(";", 1)[0].strip()
-        if s:
-            payload.append(s)
-
-    if not payload:
-        return {"ok": False, "error": "No G-code to send"}
-
-    _send_gcode(payload)
-    return {"ok": True, "sent": len(payload), "lines": payload}
-
+def disable() -> Dict[str, Any]:
+    _cfg.enabled = False
+    return {"enabled": False}
 
 def ping() -> Dict[str, Any]:
-    """Query firmware info (M115)."""
-    if not _state.enabled or _ser is None:
-        return {"ok": False, "error": "Motion disabled or serial not open"}
-    try:
-        _send_gcode(["M115"])
-        return {"ok": True}
-    except Exception as e:
-        logger.exception("Ping failed")
-        return {"ok": False, "error": str(e)}
-
-
-def home_now() -> Dict[str, Any]:
-    """Run the configured homing sequence immediately."""
-    if not _state.enabled or _ser is None:
-        return {"ok": False, "error": "Motion disabled or serial not open"}
-    try:
-        _run_homing()
-        return {"ok": True}
-    except Exception as e:
-        logger.exception("Homing failed")
-        return {"ok": False, "error": str(e)}
-
-# =========================
-# Slot / Pose resolution
-# =========================
-
-def _normalize_slot(asg: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Accept a variety of assignment payloads and return a slot dict with any of:
-      - {'x_mm': float, 'y_mm': float}
-      - {'row': int, 'col': int}
-      - {'slot_id': int}
-    None values are treated as missing.
+    Query firmware info (Marlin: M115). Returns raw response lines.
     """
-    def _has_xy(d: Dict[str, Any]) -> bool:
-        return d.get("x_mm") is not None and d.get("y_mm") is not None
+    _ensure_ready()
+    lines = send_and_wait(["M115"])
+    return {"ok": True, "response": lines}
 
-    def _has_rc(d: Dict[str, Any]) -> bool:
-        return d.get("row") is not None and d.get("col") is not None
-
-    # Prefer explicit coordinates if both are non-null
-    if _has_xy(asg):
-        try:
-            return {"x_mm": float(asg["x_mm"]), "y_mm": float(asg["y_mm"])}
-        except (TypeError, ValueError):
-            pass  # fall through
-
-    # Next prefer row/col if both are non-null
-    if _has_rc(asg):
-        try:
-            return {"row": int(asg["row"]), "col": int(asg["col"])}
-        except (TypeError, ValueError):
-            pass  # fall through
-
-    # Finally allow slot_id
-    sid = asg.get("slot_id")
-    if sid is not None:
-        try:
-            return {"slot_id": int(sid)}
-        except (TypeError, ValueError):
-            pass
-
-    raise ValueError(
-        "Assignment does not contain usable slot info; need (x_mm & y_mm) or (row & col) or slot_id"
-    )
-
-
-def _resolve_slot_pose(slot: Dict[str, Any]) -> Tuple[float, float, float, float, float]:
+def home(axes: str = "XY") -> Dict[str, Any]:
     """
-    Resolve a slot dict into a physical pose (x_mm, y_mm, z_pick, z_travel, z_safe).
-    Accepts any of:
-      - {'x_mm': X, 'y_mm': Y}
-      - {'row': r, 'col': c} (0-based)
-      - {'slot_id': N} (1-based, row-major)
+    Home axes (Marlin: G28). Example: axes='X', 'Y', 'XY', 'XYZ', or '' for all configured.
     """
-    g = _state.grid
+    _ensure_ready()
+    cmd = "G28" if not axes else f"G28 { ' '.join(list(axes)) }"
+    send_and_wait([cmd])
+    return {"ok": True}
 
-    # Direct XY
-    if "x_mm" in slot and "y_mm" in slot:
-        x = float(slot["x_mm"])
-        y = float(slot["y_mm"])
-        return (x, y, g.z_pick, g.z_travel, g.z_safe)
-
-    # Row/Col (0-based)
-    if "row" in slot and "col" in slot:
-        r = int(slot["row"])
-        c = int(slot["col"])
-        if not (0 <= r < g.rows and 0 <= c < g.cols):
-            raise ValueError(f"row/col out of range: ({r},{c}) with grid {g.rows}x{g.cols}")
-        x = g.origin_mm[0] + c * g.pitch_mm[0]
-        y = g.origin_mm[1] + r * g.pitch_mm[1]
-        return (x, y, g.z_pick, g.z_travel, g.z_safe)
-
-    # Linear slot_id (1-based)
-    if "slot_id" in slot:
-        sid = int(slot["slot_id"])
-        total = g.rows * g.cols
-        if not (1 <= sid <= total):
-            raise ValueError(f"slot_id {sid} out of range 1..{total}")
-        sid0 = sid - 1  # zero-based
-        r = sid0 // g.cols
-        c = sid0 % g.cols
-        x = g.origin_mm[0] + c * g.pitch_mm[0]
-        y = g.origin_mm[1] + r * g.pitch_mm[1]
-        return (x, y, g.z_pick, g.z_travel, g.z_safe)
-
-    raise ValueError("Slot must provide either (x_mm,y_mm), (row,col), or (slot_id)")
-
-# =========================
-# G-code generation
-# =========================
-
-def _gcode_to_slot(pose: Tuple[float, float, float, float, float]) -> List[str]:
+def test_square(size_mm: float = 20.0, feed_xy: int = 1200) -> Dict[str, Any]:
     """
-    Produce a conservative pick/place sequence to the slot pose.
-    Pose: (x_mm, y_mm, z_pick, z_travel, z_safe)
+    Draw a simple square in absolute coords around current origin.
     """
-    x, y, z_pick, z_travel, z_safe = pose
-    fxy = _state.feed_xy
-    fz = _state.feed_z
+    _ensure_ready()
+    s = float(size_mm)
+    f = int(feed_xy)
 
-    g: List[str] = []
-    g.append("G90")                                       # absolute positioning
-    g.append(f"G0 Z{z_safe:.3f} F{fz}")                   # safe Z
-    g.append(f"G0 X{x:.3f} Y{y:.3f} F{fxy}")              # travel XY
-    g.append(f"G1 Z{z_travel:.3f} F{fz}")                 # approach
-    g.append(f"G1 Z{z_pick:.3f} F{fz}")                   # pick/deposit level
-    g.append(f"G0 Z{z_safe:.3f} F{fz}")                   # retract
-    return g
+    g = [
+        "M400",              # wait for any prior moves
+        "G90",               # absolute mode
+        f"G0 Z10 F{f}",      # safe Z
+        "G92 X0 Y0",         # set current as (0,0)
+        f"G0 X0 Y0 F{f}",
+        f"G1 X{s} Y0 F{f}",
+        f"G1 X{s} Y{s} F{f}",
+        f"G1 X0 Y{s} F{f}",
+        f"G1 X0 Y0 F{f}",
+        "M400"
+    ]
+    send_and_wait(g)
+    return {"ok": True, "ran": len(g)}
 
-# =========================
-# Serial I/O (optional)
-# =========================
+def send(gcode: List[str]) -> Dict[str, Any]:
+    """
+    Send raw G-code lines and wait for their 'ok' acknowledgements.
+    """
+    _ensure_ready()
+    lines = [ln.strip() for ln in gcode if ln and ln.strip()]
+    if not lines:
+        return {"ok": True, "count": 0, "response": []}
+    resp = send_and_wait(lines)
+    return {"ok": True, "count": len(lines), "response": resp}
 
-def _open_serial() -> None:
-    global _ser
-    try:
-        import serial  # pyserial
-    except ImportError:
-        logger.error("pyserial not installed; motion cannot open serial")
-        _state.enabled = False
-        return
-    try:
-        _ser = serial.Serial(_state.port, _state.baud, timeout=1)
-        time.sleep(2.0)  # allow controller to reset
-        logger.info("Serial opened: %s @ %s", _state.port, _state.baud)
-    except Exception as e:
-        logger.error("Failed to open serial: %s", e, exc_info=True)
-        _ser = None
-        _state.enabled = False
+# =========
+# Core serial helpers
+# =========
 
-def _close_serial() -> None:
-    global _ser
-    if _ser is not None:
-        try:
-            _ser.close()
-        except Exception:
-            logger.warning("Error closing serial", exc_info=True)
-        _ser = None
+def _ensure_ready() -> None:
+    if not _initialized:
+        raise RuntimeError("Motion not initialized")
+    if not _cfg.enabled:
+        raise RuntimeError("Motion disabled (enable first)")
+    if not is_connected():
+        connect()
 
-def _run_homing() -> None:
-    if _ser is None:
-        return
-    seq = _state.homing_sequence or []
-    if not seq:
-        return
-    logger.info("Running homing sequence: %s", seq)
-    _send_gcode(seq)
-
-def _send_gcode(lines: List[str]) -> None:
-    if _ser is None:
-        raise RuntimeError("Serial not open")
-    for line in lines:
-        cmd = (line.strip() + "\n").encode()
-        _ser.write(cmd)
-        _ser.flush()
-        _read_until_ok()
-
-def _read_until_ok() -> None:
-    if _ser is None:
-        return
-    deadline = time.time() + 10.0
-    buf = b""
+def _drain_input(ser: serial.Serial, deadline: float) -> List[str]:
+    """
+    Read and discard any startup banner / residual lines until timeout.
+    """
+    seen: List[str] = []
     while time.time() < deadline:
-        b = _ser.readline()
-        if not b:
-            continue
-        buf += b
-        s = buf.decode(errors="ignore").lower()
-        if "ok" in s or "done" in s:
-            return
-    logger.warning("Timed out waiting for 'ok' from controller")
+        try:
+            raw = ser.readline()
+        except Exception:
+            break
+        if not raw:
+            break
+        try:
+            line = raw.decode(errors="ignore").strip()
+        except Exception:
+            line = ""
+        if line:
+            seen.append(line)
+    if seen:
+        logger.debug("Startup drain:\n%s", "\n".join(seen))
+    return seen
+
+def _write_line(ser: serial.Serial, line: str) -> None:
+    data = (line.strip() + "\n").encode("ascii", errors="ignore")
+    ser.write(data)
+    ser.flush()
+
+def send_and_wait(lines: List[str], overall_timeout_s: float = 60.0) -> List[str]:
+    """
+    Send lines, wait for an 'ok' (or 'error') per line. Collect responses.
+    Returns all non-empty response lines (including 'ok' tokens).
+    """
+    with _serial_lock:
+        if not _ser or not _ser.is_open:
+            raise RuntimeError("Serial not open")
+
+        ser = _ser
+        responses: List[str] = []
+        t_stop = time.time() + overall_timeout_s
+
+        for idx, ln in enumerate(lines, start=1):
+            _write_line(ser, ln)
+            logger.debug(">> %s", ln)
+
+            # Read until an ok/error appears for this line
+            while True:
+                if time.time() > t_stop:
+                    raise TimeoutError(f"Timeout waiting for 'ok' after sending: {ln!r}")
+
+                raw = ser.readline()
+                if not raw:
+                    # pyserial timeout hit for this read; keep looping until overall timeout
+                    continue
+
+                try:
+                    text = raw.decode(errors="ignore").strip()
+                except Exception:
+                    text = ""
+
+                if not text:
+                    continue
+
+                logger.debug("<< %s", text)
+                responses.append(text)
+
+                low = text.lower()
+                # Error?
+                if any(tok in low for tok in map(str.lower, _cfg.error_tokens)):
+                    raise RuntimeError(f"Firmware reported error after '{ln}': {text}")
+
+                # Busy/info lines — continue reading
+                if any(tok in low for tok in map(str.lower, _cfg.busy_tokens)):
+                    continue
+
+                # OK?
+                if any(tok in low for tok in map(str.lower, _cfg.ok_tokens)):
+                    break  # proceed to next command
+
+        return responses
