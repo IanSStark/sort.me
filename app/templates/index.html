@@ -28,6 +28,8 @@
     .mono { font-family:var(--mono); font-size:12px; white-space:pre-wrap; }
     textarea { width:100%; min-height:140px; resize:vertical; background:#0f1317; color:var(--text);
                border:1px solid #1e252c; border-radius:6px; padding:8px 10px; font-family:var(--mono); }
+    select, input[type="checkbox"] { background:#0f1317; color:var(--text); border:1px solid #1e252c; border-radius:6px; padding:6px 8px; }
+    .hint { color:var(--muted); font-size:12px; }
   </style>
 </head>
 <body>
@@ -91,6 +93,33 @@
   </div>
 </section>
 
+<!-- Zone moves -->
+<section class="card" style="max-width: 960px; margin:20px auto;">
+  <h2>Zone Moves</h2>
+  <div class="content">
+    <div class="row">
+      <button id="btnRefreshZones" class="btn">Refresh Zones</button>
+      <label class="hint">Loads from <code>/grid/zones</code></label>
+    </div>
+
+    <div class="row" style="align-items:center; margin-top:10px;">
+      <label for="zoneSelect" class="hint">Zone</label>
+      <select id="zoneSelect"></select>
+      <label style="display:flex; align-items:center; gap:8px;">
+        <input type="checkbox" id="chkSafeLift" checked>
+        <span class="hint">Safe-lift Z</span>
+      </label>
+      <button id="btnMoveZone" class="btn">Move to Zone</button>
+      <div class="hint" id="zonePreview" style="margin-left:8px;">—</div>
+    </div>
+
+    <div style="margin-top:12px;">
+      <label class="hint">Quick Buttons</label>
+      <div id="zoneButtons" class="row"></div>
+    </div>
+  </div>
+</section>
+
 <script>
   // --- helpers ---
   async function api(url, opts) {
@@ -114,6 +143,7 @@
   let lastOcrId = null;
   let lastAssignId = null;
   let lastMoveId = null;
+  let ZONES = []; // [{key,type,row,col,x_mm,y_mm}, ...]
 
   function updateIds() {
     set('capId', lastCaptureId);
@@ -122,7 +152,7 @@
     set('moveId', lastMoveId);
   }
 
-  // --- existing actions ---
+  // --- camera/ocr/sort actions ---
   document.getElementById('btnCapture').addEventListener('click', async () => {
     try {
       log('Capturing…');
@@ -179,10 +209,10 @@
     } catch (e) { log('Sort error: ' + e.message); }
   });
 
-  // --- new motion jog buttons ---
+  // --- jog buttons ---
   async function jog(axis, delta) {
     try {
-      const gcode = [`G91`, `G0 ${axis}${delta} F1200`, `G90`]; // relative move then back to absolute
+      const gcode = [`G91`, `G0 ${axis}${delta} F1200`, `G90`];
       log(`Jog ${axis}${delta}`);
       const res = await api('/motion/send', {
         method: 'POST',
@@ -198,6 +228,78 @@
   document.getElementById('btnXplus').addEventListener('click',  () => jog('X',  10));
   document.getElementById('btnYminus').addEventListener('click', () => jog('Y', -10));
   document.getElementById('btnYplus').addEventListener('click',  () => jog('Y',  10));
+
+  // --- zones: fetch, render, move ---
+  async function loadZones() {
+    try {
+      const data = await api('/grid/zones');
+      ZONES = Array.isArray(data.zones) ? data.zones : [];
+      renderZoneSelect(ZONES);
+      renderZoneButtons(ZONES);
+      log({zones: ZONES});
+      // Update preview for first option
+      const sel = document.getElementById('zoneSelect');
+      if (sel.value) updateZonePreview(sel.value);
+    } catch (e) {
+      log('Zones load error: ' + e.message);
+    }
+  }
+
+  function renderZoneSelect(zones) {
+    const sel = document.getElementById('zoneSelect');
+    sel.innerHTML = '';
+    for (const z of zones) {
+      const opt = document.createElement('option');
+      opt.value = z.key;
+      opt.textContent = `${z.key} (${z.type})`;
+      sel.appendChild(opt);
+    }
+  }
+
+  function renderZoneButtons(zones) {
+    const box = document.getElementById('zoneButtons');
+    box.innerHTML = '';
+    for (const z of zones) {
+      const b = document.createElement('button');
+      b.className = 'btn';
+      b.textContent = z.key;
+      b.title = `(${z.type}) → X${z.x_mm.toFixed(2)}, Y${z.y_mm.toFixed(2)}`;
+      b.addEventListener('click', () => moveZone(z.key));
+      box.appendChild(b);
+    }
+  }
+
+  function updateZonePreview(key) {
+    const info = ZONES.find(z => z.key === key);
+    const el = document.getElementById('zonePreview');
+    if (!info) { el.textContent = '—'; return; }
+    el.textContent = `X ${Number(info.x_mm).toFixed(2)}  Y ${Number(info.y_mm).toFixed(2)}  [${info.type}]`;
+  }
+
+  async function moveZone(key) {
+    try {
+      const safe = document.getElementById('chkSafeLift').checked;
+      log(`Move to zone ${key} (safe=${safe})…`);
+      const res = await api(`/grid/move/zone?key=${encodeURIComponent(key)}&safe_lift=${safe}`, { method: 'POST' });
+      lastMoveId = res.move_id;
+      updateIds();
+      log(res);
+    } catch (e) {
+      log('Move zone error: ' + e.message);
+    }
+  }
+
+  document.getElementById('btnRefreshZones').addEventListener('click', loadZones);
+  document.getElementById('btnMoveZone').addEventListener('click', () => {
+    const key = document.getElementById('zoneSelect').value;
+    if (key) moveZone(key);
+  });
+  document.getElementById('zoneSelect').addEventListener('change', (e) => {
+    updateZonePreview(e.target.value);
+  });
+
+  // initial load
+  loadZones();
 </script>
 </body>
 </html>
