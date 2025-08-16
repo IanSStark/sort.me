@@ -352,3 +352,11 @@ def motion_send(body: GCodeBody):
         return motion.send(body.gcode)
     except Exception as e:
         raise HTTPException(500, str(e))
+# add near other motion endpoints
+@app.post("/motion/jog")
+def motion_jog(axis: str, delta_mm: float, feed_xy: int = 1200):
+    try:
+        return motion.jog(axis=axis, delta_mm=delta_mm, feed_xy=feed_xy)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
