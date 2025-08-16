@@ -17,6 +17,9 @@ from pydantic import BaseModel, BaseSettings, Field, validator
 
 # Services
 from app.services import camera, ocr, motion
+import logging
+logger = logging.getLogger("uvicorn.error")  # or your preferred logger
+
 
 # -----------------------------------------------------------------------------
 # App metadata / logging
@@ -152,7 +155,53 @@ async def on_startup() -> None:
     # Do not auto-enable/connect; leave that to explicit UI actions
 
     log.info("Startup complete")
+@app.on_event("startup")
+async def on_startup():
+    # ... your existing startup logic (load config, init camera/ocr, motion.init(...), etc.)
+    try:
+        _auto_motion_bringup(CONFIG)  # CONFIG is whatever var holds your loaded AppConfig
+    except Exception as e:
+        # Shouldn't happen since the helper already guards, but keep this belt-and-suspenders
+        logger.warning("Startup: auto motion bring-up wrapper caught: %s", e)
 
+# --- Add this helper after you call motion.init(...) in main.py ---
+def _auto_motion_bringup(cfg):
+    """
+    Try to connect and enable motion on startup.
+    Uses cfg.motion.port/baud if present; otherwise picks the first available port.
+    Never raises (logs warnings instead) so the app still starts if the board is offline.
+    """
+    try:
+        ports_info = motion.list_ports().get("ports", [])
+        # Candidate port from config (if provided)
+        preferred = (getattr(cfg, "motion", None) or {}).get("port", None) if isinstance(cfg.motion, dict) \
+                    else getattr(cfg.motion, "port", None)
+        baud = (getattr(cfg, "motion", None) or {}).get("baud", 250000) if isinstance(cfg.motion, dict) \
+               else getattr(cfg.motion, "baud", 250000)
+
+        # Normalize available devices
+        avail = [p.get("device") for p in ports_info if p.get("device")]
+        if not avail:
+            logger.warning("Motion auto-connect: no serial ports found.")
+            return
+
+        # Pick a port: use preferred if it is in the list; else first available
+        use_port = preferred if preferred in avail else avail[0]
+        if preferred and preferred not in avail:
+            logger.warning("Motion auto-connect: preferred port %s not found; using %s", preferred, use_port)
+
+        motion.connect(port=use_port, baud=baud)
+        motion.enable()
+        try:
+            motion.ping()
+        except Exception as e:
+            # Not fatal; some firmware may not respond to M115 as expected
+            logger.warning("Motion auto-connect: ping warning: %s", e)
+
+        logger.info("Motion auto-connect: connected on %s @ %s and enabled.", use_port, baud)
+
+    except Exception as e:
+        logger.warning("Motion auto-connect failed: %s", e)
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
     try:
