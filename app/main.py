@@ -74,6 +74,18 @@ class AppConfig(BaseSettings):
     ocr: OCRConfig = Field(default_factory=OCRConfig)
     motion: MotionConfig = Field(default_factory=MotionConfig)
 
+    # (optional) explicitly capture other sections so you can read them later
+    assignment: Optional[Dict[str, Any]] = None
+    cors: Optional[Dict[str, Any]] = None
+    grid: Optional[Dict[str, Any]] = None
+    logging: Optional[Dict[str, Any]] = None
+    plunger: Optional[Dict[str, Any]] = None
+    server: Optional[Dict[str, Any]] = None
+
+    class Config:
+        extra = "allow"          # <- accept unknown top-level keys
+        case_sensitive = False
+
 # -----------------------------------------------------------------------------
 # Load config.yaml
 # -----------------------------------------------------------------------------
