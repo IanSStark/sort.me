@@ -71,14 +71,18 @@ grid:
 # Motion (MPCNC / SKR Pro) settings
 # -------------------------
 motion:
-  port: "/dev/ttyACM0"       # Serial port to SKR Pro 1.2
+  port: "/dev/ttyACM0"     # adjust if your SKR shows as ttyUSB0, etc.
   baud: 250000
-  enable: false              # Start disabled; must be enabled via API/UI before moving
-  homing_sequence:
-    - "G28"                  # Home all axes
-  feedrates:
-    xy: 3000                  # mm/min for XY moves
-    z: 600                    # mm/min for Z moves
+  enabled: false           # you can enable from the UI/endpoint
+  read_timeout_s: 2.0
+  write_timeout_s: 2.0
+  connect_timeout_s: 6.0
+  reset_on_connect: true
+  startup_drain_s: 2.0
+  ok_tokens: ["ok"]
+  error_tokens: ["error", "Error:"]
+  busy_tokens: ["busy:", "wait"]
+
 
 # -------------------------
 # Plunger (vacuum head stepper) settings
