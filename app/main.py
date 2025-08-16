@@ -20,6 +20,11 @@ from app.services import camera, ocr, motion
 import logging
 logger = logging.getLogger("uvicorn.error")  # or your preferred logger
 
+from app.services import grid as grid_svc
+from app.services import motion
+from app import models, assign   # you already use these elsewhere
+
+GRID: grid_svc.Grid | None = None
 
 # -----------------------------------------------------------------------------
 # App metadata / logging
@@ -163,6 +168,14 @@ async def on_startup():
     except Exception as e:
         # Shouldn't happen since the helper already guards, but keep this belt-and-suspenders
         logger.warning("Startup: auto motion bring-up wrapper caught: %s", e)
+
+@app.on_event("startup")
+async def on_startup():
+    # ... your existing startup code ...
+    global GRID
+    GRID = grid_svc.Grid(CONFIG.grid)
+    # keep your existing auto-connect/enable bring-up
+
 
 # --- Add this helper after you call motion.init(...) in main.py ---
 def _auto_motion_bringup(cfg):
@@ -406,6 +419,53 @@ def motion_send(body: GCodeBody):
 def motion_jog(axis: str, delta_mm: float, feed_xy: int = 1200):
     try:
         return motion.jog(axis=axis, delta_mm=delta_mm, feed_xy=feed_xy)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+from fastapi import HTTPException
+
+@app.get("/grid/zones")
+def grid_list_zones():
+    try:
+        return {"zones": GRID.list_zones()}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.post("/grid/move/zone")
+def grid_move_zone(key: str, safe_lift: bool = True):
+    try:
+        z = GRID.get_zone(key)
+        return motion.goto_xy(z.x_mm, z.y_mm, safe_lift=safe_lift)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.post("/grid/move/rc")
+def grid_move_rc(row: int, col: int, safe_lift: bool = True):
+    try:
+        x, y = GRID.slot_rc_to_xy(row, col)
+        return motion.goto_xy(x, y, safe_lift=safe_lift)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.post("/grid/move/slotid")
+def grid_move_slotid(slot_id: int, safe_lift: bool = True):
+    try:
+        r, c = GRID.slotid_to_rc(slot_id)
+        x, y = GRID.slot_rc_to_xy(r, c)
+        return motion.goto_xy(x, y, safe_lift=safe_lift)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.post("/grid/move/letter")
+def grid_move_letter(letter: str, safe_lift: bool = True):
+    try:
+        z = GRID.letter_to_zone(letter)
+        if not z:
+            raise HTTPException(404, f"No zone mapped for letter '{letter}'")
+        return motion.goto_xy(z.x_mm, z.y_mm, safe_lift=safe_lift)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, str(e))
 
