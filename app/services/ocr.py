@@ -3,10 +3,9 @@ from __future__ import annotations
 
 import logging
 import math
-import shlex
 import subprocess
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import cv2
 import numpy as np
@@ -21,20 +20,33 @@ logger = logging.getLogger("ocr")
 
 @dataclass
 class OCRState:
+    # engine/config
     engine: str = "tesseract"
     lang: str = "eng"
-    psm: int = 6
-    whitelist: Optional[str] = None
+    psm: int = 7                           # single text line (good for names/titles at top)
+    whitelist: Optional[str] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'-. "
 
-    # Preprocessing toggles
-    enable_orientation: bool = True
+    # preprocessing/toggles
     enable_deskew: bool = True
-    gamma: float = 1.0
+    gamma: float = 1.1
     denoise: bool = True
     unsharp: bool = True
     adaptive_thresh: bool = True
     invert_if_needed: bool = True
     otsu_fallback: bool = True
+
+    # ROI band (percentages of full image width/height)
+    # default: top 22% height; trim 5% from left/right to avoid borders
+    roi_top_pct: float = 0.00
+    roi_height_pct: float = 0.22
+    roi_left_pct: float = 0.05
+    roi_right_pct: float = 0.95
+
+    # rotations to test (degrees). Cards may be 0 or 180.
+    rotations: Tuple[int, int] = (0, 180)
+
+    # min width for OCR (ROI upscaled if smaller)
+    min_ocr_width: int = 900
 
     initialized: bool = False
 
@@ -49,6 +61,13 @@ _state = OCRState()
 def init(cfg: Dict[str, Any]) -> None:
     """
     Initialize the OCR module with configuration from main.py / config.yaml.
+    Extra supported keys under `ocr:` in config.yaml:
+      psm: 7
+      whitelist: "ABC..."
+      roi: { top_pct: 0.00, height_pct: 0.22, left_pct: 0.05, right_pct: 0.95 }
+      rotations: [0, 180]
+      gamma: 1.1
+      ...
     """
     global _state
     _state.engine = str(cfg.get("engine", _state.engine))
@@ -57,7 +76,6 @@ def init(cfg: Dict[str, Any]) -> None:
     wl = cfg.get("whitelist", _state.whitelist)
     _state.whitelist = None if wl in (None, "", "null", "None") else str(wl)
 
-    _state.enable_orientation = bool(cfg.get("enable_orientation", _state.enable_orientation))
     _state.enable_deskew = bool(cfg.get("enable_deskew", _state.enable_deskew))
     _state.gamma = float(cfg.get("gamma", _state.gamma))
     _state.denoise = bool(cfg.get("denoise", _state.denoise))
@@ -66,7 +84,19 @@ def init(cfg: Dict[str, Any]) -> None:
     _state.invert_if_needed = bool(cfg.get("invert_if_needed", _state.invert_if_needed))
     _state.otsu_fallback = bool(cfg.get("otsu_fallback", _state.otsu_fallback))
 
-    # Basic sanity check that tesseract is callable
+    roi_cfg = cfg.get("roi", {}) or {}
+    _state.roi_top_pct = float(roi_cfg.get("top_pct", _state.roi_top_pct))
+    _state.roi_height_pct = float(roi_cfg.get("height_pct", _state.roi_height_pct))
+    _state.roi_left_pct = float(roi_cfg.get("left_pct", _state.roi_left_pct))
+    _state.roi_right_pct = float(roi_cfg.get("right_pct", _state.roi_right_pct))
+
+    rots = cfg.get("rotations", _state.rotations)
+    if isinstance(rots, (list, tuple)) and rots:
+        _state.rotations = tuple(int(r) for r in rots)
+
+    _state.min_ocr_width = int(cfg.get("min_ocr_width", _state.min_ocr_width))
+
+    # Validate tesseract availability
     if _state.engine.lower() == "tesseract":
         try:
             out = subprocess.run(
@@ -79,8 +109,9 @@ def init(cfg: Dict[str, Any]) -> None:
 
     _state.initialized = True
     logger.info(
-        "OCR initialized: engine=%s, lang=%s, psm=%d",
-        _state.engine, _state.lang, _state.psm
+        "OCR initialized: engine=%s, lang=%s, psm=%d, rotations=%s, roi(top/height/left/right)=%.2f/%.2f/%.2f/%.2f",
+        _state.engine, _state.lang, _state.psm, _state.rotations,
+        _state.roi_top_pct, _state.roi_height_pct, _state.roi_left_pct, _state.roi_right_pct
     )
 
 
@@ -90,8 +121,15 @@ def status() -> bool:
 
 def run(image_path: str) -> Dict[str, Any]:
     """
-    Execute OCR on the given image path.
-    Returns: { 'text': str, 'confidence': int, 'boxes': {...} }
+    Execute OCR on the given image path focusing on the top-band ROI and choosing the best
+    among configured rotations (e.g., 0 and 180 deg).
+    Returns: {
+      'text': str,
+      'confidence': int,
+      'boxes': {...},
+      'rotation': int,
+      'roi_px': [x1,y1,x2,y2]
+    }
     """
     if not _state.initialized:
         raise RuntimeError("OCR not initialized")
@@ -100,16 +138,42 @@ def run(image_path: str) -> Dict[str, Any]:
     if img_bgr is None:
         raise RuntimeError(f"Failed to read image: {image_path}")
 
-    proc = _preprocess(img_bgr, _state)
-    text, data = _run_tesseract(proc, _state)
+    h, w = img_bgr.shape[:2]
+    x1, y1, x2, y2 = _roi_rect_px(w, h, _state)
+    best = {"confidence": -1, "text": "", "data": {}, "rotation": 0}
 
-    # Clean final text
-    text = text.replace("\r", " ").strip()
+    for rot in _state.rotations:
+        rotated = _rotate_bound_color(img_bgr, rot) if rot != 0 else img_bgr
+        # recompute ROI after rotation because dims change
+        hr, wr = rotated.shape[:2]
+        rx1, ry1, rx2, ry2 = _roi_rect_px(wr, hr, _state)
+        roi = rotated[ry1:ry2, rx1:rx2].copy()
 
-    # Confidence normalization to 0..100 (int)
-    confidence = int(max(0, min(100, data.get("confidence", 0))))
+        proc = _preprocess(roi, _state)
 
-    return {"text": text, "confidence": confidence, "boxes": data.get("boxes", {})}
+        text, data = _run_tesseract(proc, _state)
+
+        # Extract a single "best" line: longest alnum-heavy line
+        text_lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if text_lines:
+            text_pick = max(text_lines, key=lambda s: (_alpha_ratio(s), len(s)))
+        else:
+            text_pick = text.strip()
+
+        conf = int(max(0, min(100, data.get("confidence", 0))))
+        # Favor results with higher alpha ratio when confidences tie
+        tiebreak = (_alpha_ratio(text_pick), conf)
+        if (conf > best["confidence"]) or (conf == best["confidence"] and tiebreak > (_alpha_ratio(best["text"]), best["confidence"])):
+            best = {"confidence": conf, "text": text_pick, "data": data, "rotation": rot, "roi": (rx1, ry1, rx2, ry2)}
+
+    result = {
+        "text": best["text"].replace("\r", " ").strip(),
+        "confidence": int(best["confidence"]),
+        "boxes": best["data"].get("boxes", {}),
+        "rotation": int(best["rotation"]),
+        "roi_px": list(best.get("roi", (x1, y1, x2, y2))),
+    }
+    return result
 
 
 # =========================
@@ -118,12 +182,17 @@ def run(image_path: str) -> Dict[str, Any]:
 
 def _preprocess(img_bgr: np.ndarray, st: OCRState) -> np.ndarray:
     """
-    Apply a conservative, OCR-friendly preprocessing pipeline.
-    Returns a single-channel or three-channel image suitable for Tesseract.
+    Prepare ROI for robust single-line OCR.
     """
     img = img_bgr.copy()
 
-    # Optional gamma correction (improves contrast in low light)
+    # Resize up to min width if necessary (helps Tesseract)
+    h, w = img.shape[:2]
+    if w < st.min_ocr_width:
+        scale = st.min_ocr_width / float(max(1, w))
+        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+
+    # Gamma
     if st.gamma and abs(st.gamma - 1.0) > 1e-3:
         try:
             inv_gamma = 1.0 / max(1e-3, st.gamma)
@@ -133,31 +202,30 @@ def _preprocess(img_bgr: np.ndarray, st: OCRState) -> np.ndarray:
         except Exception:
             logger.debug("Gamma correction skipped", exc_info=True)
 
-    # Convert to grayscale
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # Light denoise to reduce speckle, preserve edges
+    # Light denoise
     if st.denoise:
         gray = cv2.bilateralFilter(gray, d=7, sigmaColor=50, sigmaSpace=50)
 
-    # Optional orientation detection (coarse)
-    if st.enable_orientation:
+    # Optional deskew (Hough-based)
+    if st.enable_deskew:
         try:
             angle = _estimate_skew_angle(gray)
-            if abs(angle) > 0.5 and st.enable_deskew:
+            if abs(angle) > 0.5:
                 gray = _rotate_bound(gray, -angle)
         except Exception:
-            logger.debug("Orientation/deskew skipped", exc_info=True)
+            logger.debug("Deskew skipped", exc_info=True)
 
-    # Unsharp mask to sharpen titles
+    # Unsharp
     if st.unsharp:
         try:
             blur = cv2.GaussianBlur(gray, (0, 0), 1.0)
-            gray = cv2.addWeighted(gray, 1.5, blur, -0.5, 0)
+            gray = cv2.addWeighted(gray, 1.6, blur, -0.6, 0)
         except Exception:
             logger.debug("Unsharp skip", exc_info=True)
 
-    # Binarization
+    # Binarize
     bin_img = None
     if st.adaptive_thresh:
         try:
@@ -174,39 +242,33 @@ def _preprocess(img_bgr: np.ndarray, st: OCRState) -> np.ndarray:
             logger.debug("OTSU threshold failed", exc_info=True)
             bin_img = gray
 
-    # Optional inversion if text appears light on dark
+    # Optional inversion if background too bright
     if st.invert_if_needed:
         try:
-            mean_val = float(np.mean(bin_img))
-            if mean_val > 180:  # very bright -> likely inverted
+            if float(np.mean(bin_img)) > 180:
                 bin_img = cv2.bitwise_not(bin_img)
         except Exception:
             pass
 
-    # Tesseract accepts single channel or 3-channel BGR; prefer single channel.
     return bin_img
 
 
 def _run_tesseract(img: np.ndarray, st: OCRState) -> Tuple[str, Dict[str, Any]]:
     """
-    Run tesseract safely. Properly quotes -c values to avoid shlex errors.
-    Returns (text, meta) where meta includes 'confidence' and 'boxes'.
+    Run tesseract safely with PSM and whitelist tuned for single-line OCR.
     """
-    # Build robust config string
-    tokens = [f"--psm {int(getattr(st, 'psm', 6))}"]
-
+    # Build config tokens
+    tokens: List[str] = [f"--psm {int(getattr(st, 'psm', 7))}"]
     wl = getattr(st, "whitelist", None)
     if wl:
         tokens.append(f"-c tessedit_char_whitelist={_quote_tess_value(str(wl))}")
-
     config = " ".join(tokens)
 
     try:
-        # Main text
         text = pytesseract.image_to_string(img, lang=st.lang, config=config)
 
-        # Try to collect per-word boxes and confidences
-        data = {}
+        # Collect conf/boxes (word level)
+        data: Dict[str, Any] = {}
         try:
             df = pytesseract.image_to_data(img, lang=st.lang, config=config, output_type=Output.DICT)
             boxes = []
@@ -227,15 +289,13 @@ def _run_tesseract(img: np.ndarray, st: OCRState) -> Tuple[str, Dict[str, Any]]:
                 confs.append(conf)
             data["boxes"] = {"words": boxes}
             data["confidence"] = _aggregate_confidence(confs, text)
-
         except Exception:
-            # Fallback if image_to_data fails
             data = {"boxes": {}, "confidence": _estimate_confidence(text)}
 
         return text, data
 
     except Exception as e:
-        logger.error("Tesseract image_to_string failed: %s", e, exc_info=True)
+        logger.error("Tesseract failed: %s", e, exc_info=True)
         raise RuntimeError("OCR text extraction failed")
 
 
@@ -244,102 +304,75 @@ def _run_tesseract(img: np.ndarray, st: OCRState) -> Tuple[str, Dict[str, Any]]:
 # =========================
 
 def _quote_tess_value(val: str) -> str:
-    """
-    Quote a value for use in `-c key=value` so that pytesseract's shlex.split()
-    parses it safely. Use double quotes and escape \ and " (do not use single quotes).
-    """
+    # Safe for shlex in pytesseract
     return '"' + val.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
+def _roi_rect_px(w: int, h: int, st: OCRState) -> Tuple[int, int, int, int]:
+    left = int(max(0.0, min(1.0, st.roi_left_pct)) * w)
+    right = int(max(0.0, min(1.0, st.roi_right_pct)) * w)
+    top = int(max(0.0, min(1.0, st.roi_top_pct)) * h)
+    height = int(max(0.0, min(1.0, st.roi_height_pct)) * h)
+    bottom = min(h, top + max(1, height))
+    left, right = min(left, right-1), max(left+1, right)
+    return left, top, right, bottom
+
+def _alpha_ratio(s: str) -> float:
+    if not s:
+        return 0.0
+    alnum = sum(ch.isalnum() for ch in s)
+    return alnum / max(1, len(s))
 
 def _estimate_skew_angle(gray: np.ndarray) -> float:
-    """
-    Estimate text skew angle via Hough on edges. Returns degrees.
-    Positive angle means clockwise skew.
-    """
     edges = cv2.Canny(gray, 50, 150)
-    lines = cv2.HoughLines(edges, 1, np.pi / 180.0, threshold=120)
+    lines = cv2.HoughLines(edges, 1, np.pi/180.0, threshold=120)
     if lines is None:
         return 0.0
-
     angles = []
     for rho_theta in lines:
-        rho, theta = rho_theta[0]
-        # Convert to degrees relative to horizontal text
+        _, theta = rho_theta[0]
         angle = (theta * 180.0 / np.pi) - 90.0
-        # Normalize to [-45, 45] for stability
-        if angle < -90:
-            angle += 180
-        if angle > 90:
-            angle -= 180
+        if angle < -90: angle += 180
+        if angle >  90: angle -= 180
         if -45 <= angle <= 45:
             angles.append(angle)
-
     if not angles:
         return 0.0
-
-    # Use median for robustness
     return float(np.median(angles))
 
-
 def _rotate_bound(gray: np.ndarray, angle_deg: float) -> np.ndarray:
-    """
-    Rotate an image without cropping, keeping full content.
-    """
-    (h, w) = gray.shape[:2]
+    h, w = gray.shape[:2]
     center = (w // 2, h // 2)
     m = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
-
-    cos = abs(m[0, 0])
-    sin = abs(m[0, 1])
+    cos, sin = abs(m[0,0]), abs(m[0,1])
     nW = int((h * sin) + (w * cos))
     nH = int((h * cos) + (w * sin))
-
     m[0, 2] += (nW / 2) - center[0]
     m[1, 2] += (nH / 2) - center[1]
     return cv2.warpAffine(gray, m, (nW, nH), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
+def _rotate_bound_color(img: np.ndarray, angle_deg: float) -> np.ndarray:
+    h, w = img.shape[:2]
+    center = (w // 2, h // 2)
+    m = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+    cos, sin = abs(m[0,0]), abs(m[0,1])
+    nW = int((h * sin) + (w * cos))
+    nH = int((h * cos) + (w * sin))
+    m[0, 2] += (nW / 2) - center[0]
+    m[1, 2] += (nH / 2) - center[1]
+    return cv2.warpAffine(img, m, (nW, nH), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
-def _aggregate_confidence(confs: list[int], text: str) -> int:
-    """
-    Aggregate confidences from Tesseract's word list.
-    Returns an int in 0..100. Ignores -1 entries.
-    """
+def _aggregate_confidence(confs: List[int], text: str) -> int:
     vals = [c for c in confs if isinstance(c, (int, float)) and c >= 0]
     if not vals:
         return _estimate_confidence(text)
-    # Weighted by sqrt(length) of reconstructed text might be overkill; simple mean is OK.
     return int(round(float(np.mean(vals))))
 
-
 def _estimate_confidence(text: str) -> int:
-    """
-    Heuristic confidence if detailed confidences are missing.
-    Penalize very short or whitespace-heavy outputs.
-    """
     if not text or not text.strip():
         return 0
     t = text.strip()
     letters = sum(ch.isalnum() for ch in t)
     ratio = letters / max(1, len(t))
-    # map ratio to [30..95] depending on length
-    base = 30 + int(65 * ratio)
+    base = 35 + int(60 * ratio)
     length_bonus = min(10, int(math.log10(max(10, len(t))) * 8))
     return int(max(0, min(100, base + length_bonus)))
-
-import pytesseract
-import logging
-from PIL import Image
-
-logger = logging.getLogger("ocr")
-
-def run_ocr(image_path: str) -> str:
-    """Run OCR on the given image and return the detected text."""
-    try:
-        img = Image.open(image_path)
-        text = pytesseract.image_to_string(img, lang="eng", config="--psm 6")
-        logger.info(f"[OCR] Detected text: {text.strip()}")
-        return text.strip()
-    except Exception as e:
-        logger.exception(f"OCR failed: {e}")
-        return ""
-
