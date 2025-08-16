@@ -49,31 +49,70 @@ motion:
 # Converts a slot index (e.g., 1..N) or letter ('A'..'Z') into XY coordinates
 # --------
 grid:
-  # Define a simple rectangular lattice of bins.
-  rows: 2                     # number of rows of bins
-  cols: 13                    # number of columns (2x13 = 26 bins → A..Z)
-  origin_xy_mm: [10.0, 10.0]  # lower-left bin center (X0,Y0) in machine coordinates (mm)
-  pitch_xy_mm:  [35.0, 35.0]  # center-to-center spacing between bins in X and Y
-  row_major: true             # if true: index increases across X first, then Y
+  rows: 1
+  cols: 6
+  origin_xy_mm: [10.0, 10.0]   # center of (row=0,col=0)
+  pitch_xy_mm:  [35.0, 0.0]    # 35 mm step in X, 0 in Y (single row)
+  row_major: true
 
-  # Optional per-letter overrides (use to fine-tune bin centers)
-  # Format: LETTER: [X_mm, Y_mm]
+  # Optional fine trims per zone key (mm)
   overrides: { }
 
-  # Dwell after arriving at a bin (allow vibrations to settle, in seconds)
-  settle_s: 0.25
+  # Define named zones (0-based row/col)
+  zones:
+    - key: FEED
+      type: feeder
+      row: 0
+      col: 0
+    - key: S1
+      type: sort
+      row: 0
+      col: 1
+    - key: S2
+      type: sort
+      row: 0
+      col: 2
+    - key: S3
+      type: sort
+      row: 0
+      col: 3
+    - key: S4
+      type: sort
+      row: 0
+      col: 4
+    - key: S5
+      type: sort
+      row: 0
+      col: 5
 
-  # Mapping mode for classification results
-  # - "alpha_26": A→bin 1, B→2, … Z→26
-  # - "custom_map": use "letter_to_slot" table below
-  mapping_mode: "alpha_26"
-
-  # Optional custom mapping, activated when mapping_mode == "custom_map"
-  # letter_to_slot:
-  #   A: 5
-  #   B: 1
-  #   ...
-  letter_to_slot: { }
+  # Optional: map letters to zone keys for alphabetizing (enable when ready)
+  alpha_map:
+    A: S1
+    B: S1
+    C: S1
+    D: S2
+    E: S2
+    F: S2
+    G: S3
+    H: S3
+    I: S3
+    J: S4
+    K: S4
+    L: S4
+    M: S5
+    N: S5
+    O: S5
+    P: S5
+    Q: S5
+    R: S5
+    S: S5
+    T: S5
+    U: S5
+    V: S5
+    W: S5
+    X: S5
+    Y: S5
+    Z: S5
 
 # --------
 # PLUNGER / ACTUATOR (optional)
