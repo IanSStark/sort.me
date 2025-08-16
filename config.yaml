@@ -1,109 +1,189 @@
 # =========================
-# Card Sorter Configuration
+# sort.me — application configuration
 # =========================
 
-# -------------------------
-# Camera settings
-# -------------------------
-camera:
-  # device:            # keep commented
-  resolution: [1280, 720]
-  preview_fps: 5
-
-
-# -------------------------
-# OCR settings
-# -------------------------
-ocr:
-  engine: tesseract
-  lang: eng
-  psm: 6              # Assume a single uniform block of text
-  oem: 3              # Default LSTM OCR engine
-
-  # Confidence settings
-  min_confidence: 75  # Raise minimum confidence (0–100)
-  max_results: 5      # Only return top 5 strongest detections
-
-  # Image preprocessing
-  preprocess:
-    grayscale: true
-    threshold: true
-    denoise: true
-    sharpen: true
-    resize: 1.5       # Scale up image for better OCR accuracy
-
-  # Region of interest prioritization
-  roi:
-    mode: top_priority
-    top_fraction: 0.35   # Give highest priority to top 35% of the image
-    fallback_full: true  # If no confident result in top, use full image scan
-
-  # Debugging / logging
-  save_debug: true       # Save intermediate processed images
-  log_text_output: true  # Print detected text with confidence
-
-
-# -------------------------
-# Assignment (slot mapping) settings
-# -------------------------
-assignment:
-  mode: "first_letter"
-  slots_csv: "slots.csv"
-  default_slot: null
-  first_letter_groups: {}   # empty map is valid
-
-
-
-# -------------------------
-# Grid settings for MPCNC slot positions
-# -------------------------
-grid:
-  origin_mm: [0.0, 0.0]      # Machine coordinates (X0,Y0) for slot (row=0,col=0) center
-  pitch_mm: [70.0, 95.0]     # Distance between slot centers (X, Y) in mm
-  rows: 5
-  cols: 10
-  z:
-    pick: -2.0               # Z height for picking/placing card
-    travel: 15.0             # Z height for moving between slots
-    safe: 20.0               # Z height for safe clearance above all slots
-
-# -------------------------
-# Motion (MPCNC / SKR Pro) settings
-# -------------------------
+# --------
+# MOTION (MPCNC running Marlin)
+# --------
 motion:
-  port: "/dev/ttyACM0"     # adjust if your SKR shows as ttyUSB0, etc.
+  # Serial connection
+  port: "/dev/ttyACM0"        # e.g., /dev/ttyACM0, /dev/ttyUSB0 (Linux) | COM3 (Windows)
   baud: 250000
-  enabled: false           # you can enable from the UI/endpoint
+  enabled: false              # app starts with motion disabled; enable via API/UI
   read_timeout_s: 2.0
   write_timeout_s: 2.0
   connect_timeout_s: 6.0
+
+  # Reset behavior on connect (depends on your USB–MCU wiring)
   reset_on_connect: true
-  startup_drain_s: 2.0
+  startup_drain_s: 2.0        # give Marlin time to print startup banner and clear it
+
+  # Firmware response tokens (Marlin)
   ok_tokens: ["ok"]
   error_tokens: ["error", "Error:"]
   busy_tokens: ["busy:", "wait"]
 
+  # Default movement & safety (tweak for your machine)
+  absolute_mode: true         # G90 by default
+  safe_z_mm: 5.0              # Z lift for travels to avoid collisions (set to 0 if not needed)
+  travel_feed_xy: 1800        # mm/min default traverse feedrate in XY
+  travel_feed_z: 600          # mm/min default Z feedrate
 
-# -------------------------
-# Plunger (vacuum head stepper) settings
-# -------------------------
+  # Homing behavior (requires endstops if true)
+  home_on_start: false
+  home_axes: "XY"             # options: "X", "Y", "Z", "XY", "XYZ" (honored only if homing is supported)
+
+  # Standby position after a placement (set null to skip)
+  standby_pos:
+    x: 0.0
+    y: 0.0
+    z: 10.0
+
+  # Motion test square defaults (used by /motion/test-square)
+  test_square:
+    size_mm: 20.0
+    feed_xy: 1200
+
+# --------
+# GRID / BINS
+# Converts a slot index (e.g., 1..N) or letter ('A'..'Z') into XY coordinates
+# --------
+grid:
+  # Define a simple rectangular lattice of bins.
+  rows: 2                     # number of rows of bins
+  cols: 13                    # number of columns (2x13 = 26 bins → A..Z)
+  origin_xy_mm: [10.0, 10.0]  # lower-left bin center (X0,Y0) in machine coordinates (mm)
+  pitch_xy_mm:  [35.0, 35.0]  # center-to-center spacing between bins in X and Y
+  row_major: true             # if true: index increases across X first, then Y
+
+  # Optional per-letter overrides (use to fine-tune bin centers)
+  # Format: LETTER: [X_mm, Y_mm]
+  overrides: { }
+
+  # Dwell after arriving at a bin (allow vibrations to settle, in seconds)
+  settle_s: 0.25
+
+  # Mapping mode for classification results
+  # - "alpha_26": A→bin 1, B→2, … Z→26
+  # - "custom_map": use "letter_to_slot" table below
+  mapping_mode: "alpha_26"
+
+  # Optional custom mapping, activated when mapping_mode == "custom_map"
+  # letter_to_slot:
+  #   A: 5
+  #   B: 1
+  #   ...
+  letter_to_slot: { }
+
+# --------
+# PLUNGER / ACTUATOR (optional)
+# Use if you have a Z-based drop, solenoid, servo, or an auxiliary axis
+# --------
 plunger:
-  enable_pin: 18              # BCM numbering
-  step_pin: 23
-  dir_pin: 24
-  enable_active_low: true
-  dir_invert: false
-  backend: null               # null = auto, or "pigpio" / "rpigpio"
+  # Approach parameters (used if you perform a drop sequence at a bin)
+  use_z_drop: true            # if false, skip Z actuation entirely
+  approach_z_mm: 5.0          # Z height before drop
+  drop_z_mm: 0.5              # how far to move down to release a card
+  retract_z_mm: 8.0           # retract to this Z after drop
+  feed_z_approach: 600        # mm/min
+  feed_z_drop: 300            # mm/min
+  feed_z_retract: 600         # mm/min
+  dwell_after_drop_s: 0.15    # pause to ensure clean release
 
-# -------------------------
-# Server & logging
-# -------------------------
+  # If you use a GPIO or servo instead of Z, define those here (app logic may need to call this)
+  gpio:
+    enabled: false
+    pin: 17                   # BCM numbering
+    active_high: true
+    pulse_ms: 120
+
+  servo:
+    enabled: false
+    channel: 0                # depends on your servo driver
+    angle_open: 45
+    angle_closed: 0
+    pulse_ms: 250
+
+# --------
+# CAMERA
+# --------
+camera:
+  device: null                # e.g., 0 for default webcam; null for auto-discovery if supported
+  backend: null               # e.g., "opencv", "picamera2"; null lets app decide
+  resolution: [1280, 720]
+  preview_fps: 10
+  rotate_deg: 0               # 0|90|180|270
+  flip_horizontal: false
+  flip_vertical: false
+  captures_dir: "captures"    # where snapshots are saved
+
+# --------
+# OCR
+# --------
+ocr:
+  engine: "tesseract"         # or another engine supported by your code
+  lang: "eng"
+  psm: 6                      # Tesseract page segmentation mode
+  oem: 1                      # Tesseract engine mode
+  whitelist: null             # e.g., "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+  min_accept_confidence: 75   # reject if mean conf below this threshold
+  top_priority_fraction: 0.35 # prefer top line fraction of the image (card titles often at top)
+  top_bias_bonus: 10.0        # bias score added to lines in the top region
+  min_line_chars: 3
+  # Optional region-of-interest (cropping) as fractions of the full frame [0..1]
+  # Useful to restrict OCR to where titles usually appear.
+  roi_fraction:
+    x0: 0.05
+    y0: 0.05
+    x1: 0.95
+    y1: 0.35
+
+# --------
+# PIPELINE / SORT LOGIC
+# --------
+pipeline:
+  # If true, automatically perform: capture → OCR → decide bin → move → drop → standby
+  auto_place_after_ocr: false
+
+  # If OCR fails or confidence too low
+  on_ocr_fail: "skip"         # "skip" | "park" | "retry"
+  max_retries: 1
+  retry_dwell_s: 0.5
+
+  # Letter extraction rules
+  # - "first_alpha": first alphabetical character from OCR result
+  # - "first_word_initial": take initial of first token (robust for titles)
+  letter_rule: "first_word_initial"
+
+# --------
+# SERVER / UI
+# --------
 server:
   host: "0.0.0.0"
   port: 8000
+  templates_dir: "templates"
+  static_dir: "static"
 
-logging:
-  level: "INFO"               # DEBUG, INFO, WARNING, ERROR
-
+# --------
+# CORS
+# --------
 cors:
-  allow_origins: ["*"]        # CORS allowlist for web UI connections
+  allow_origins: ["*"]
+  allow_methods: ["*"]
+  allow_headers: ["*"]
+  allow_credentials: false
+
+# --------
+# LOGGING
+# --------
+logging:
+  level: "INFO"               # DEBUG | INFO | WARNING | ERROR
+  log_to_file: false
+  file_path: "sortme.log"
+  max_bytes: 10485760         # 10 MB
+  backup_count: 5
+
+# --------
+# ASSIGNMENT / MISC (reserved for UI helpers or future use)
+# --------
+assignment: { }
