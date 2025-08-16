@@ -15,18 +15,33 @@ camera:
 # OCR settings
 # -------------------------
 ocr:
-  engine: "tesseract"       # Currently only "tesseract" supported
-  lang: "eng"               # Tesseract language code
-  psm: 6                    # Page segmentation mode: 6 = single uniform block of text
-  whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz' :-"
-  enable_orientation: true  # Detect rotation angle
-  enable_deskew: true       # Deskew image using detected rotation
-  gamma: 1.0                 # Gamma correction (1.0 = none)
-  denoise: true              # Apply light denoising
-  unsharp: true              # Apply unsharp mask for clarity
-  adaptive_thresh: true      # Use adaptive threshold binarization
-  invert_if_needed: true     # Auto-invert if dark background
-  otsu_fallback: true        # Fallback to Otsu threshold if adaptive fails
+  engine: tesseract
+  lang: eng
+  psm: 6              # Assume a single uniform block of text
+  oem: 3              # Default LSTM OCR engine
+
+  # Confidence settings
+  min_confidence: 75  # Raise minimum confidence (0–100)
+  max_results: 5      # Only return top 5 strongest detections
+
+  # Image preprocessing
+  preprocess:
+    grayscale: true
+    threshold: true
+    denoise: true
+    sharpen: true
+    resize: 1.5       # Scale up image for better OCR accuracy
+
+  # Region of interest prioritization
+  roi:
+    mode: top_priority
+    top_fraction: 0.35   # Give highest priority to top 35% of the image
+    fallback_full: true  # If no confident result in top, use full image scan
+
+  # Debugging / logging
+  save_debug: true       # Save intermediate processed images
+  log_text_output: true  # Print detected text with confidence
+
 
 # -------------------------
 # Assignment (slot mapping) settings
