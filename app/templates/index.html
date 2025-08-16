@@ -78,6 +78,19 @@
   </section>
 </main>
 
+<!-- Motion test controls -->
+<section class="card" style="max-width: 960px; margin:20px auto;">
+  <h2>Motion Test (Jog 10 mm)</h2>
+  <div class="content">
+    <div class="row">
+      <button id="btnXminus" class="btn">X -10</button>
+      <button id="btnXplus"  class="btn">X +10</button>
+      <button id="btnYminus" class="btn">Y -10</button>
+      <button id="btnYplus"  class="btn">Y +10</button>
+    </div>
+  </div>
+</section>
+
 <script>
   // --- helpers ---
   async function api(url, opts) {
@@ -109,7 +122,7 @@
     set('moveId', lastMoveId);
   }
 
-  // --- actions ---
+  // --- existing actions ---
   document.getElementById('btnCapture').addEventListener('click', async () => {
     try {
       log('Capturing…');
@@ -118,9 +131,7 @@
       set('imgPath', cap.path);
       updateIds();
       log({capture: cap});
-    } catch (e) {
-      log('Capture error: ' + e.message);
-    }
+    } catch (e) { log('Capture error: ' + e.message); }
   });
 
   document.getElementById('btnOCR').addEventListener('click', async () => {
@@ -133,9 +144,7 @@
       document.getElementById('ocrText').textContent = res.text || '—';
       set('ocrConf', String(res.confidence ?? '–'));
       log({ocr: res});
-    } catch (e) {
-      log('OCR error: ' + e.message);
-    }
+    } catch (e) { log('OCR error: ' + e.message); }
   });
 
   document.getElementById('btnCapOCR').addEventListener('click', async () => {
@@ -145,17 +154,13 @@
       lastCaptureId = cap.capture_id;
       set('imgPath', cap.path);
       updateIds();
-
       const res = await api(`/ocr/${lastCaptureId}`, { method: 'POST' });
       lastOcrId = res.ocr_id;
       updateIds();
       document.getElementById('ocrText').textContent = res.text || '—';
       set('ocrConf', String(res.confidence ?? '–'));
-
       log({capture: cap, ocr: res});
-    } catch (e) {
-      log('Capture+OCR error: ' + e.message);
-    }
+    } catch (e) { log('Capture+OCR error: ' + e.message); }
   });
 
   document.getElementById('btnSort').addEventListener('click', async () => {
@@ -168,16 +173,31 @@
       lastMoveId = res.move_id;
       set('imgPath', '(see /captures)');
       updateIds();
-
-      // show the detected OCR text and confidence from pipeline
       document.getElementById('ocrText').textContent = res.text || '—';
       set('ocrConf', String(res.confidence ?? '–'));
-
       log(res);
-    } catch (e) {
-      log('Sort error: ' + e.message);
-    }
+    } catch (e) { log('Sort error: ' + e.message); }
   });
+
+  // --- new motion jog buttons ---
+  async function jog(axis, delta) {
+    try {
+      const gcode = [`G91`, `G0 ${axis}${delta} F1200`, `G90`]; // relative move then back to absolute
+      log(`Jog ${axis}${delta}`);
+      const res = await api('/motion/send', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ gcode })
+      });
+      lastMoveId = res.move_id;
+      updateIds();
+      log(res);
+    } catch (e) { log('Jog error: ' + e.message); }
+  }
+  document.getElementById('btnXminus').addEventListener('click', () => jog('X', -10));
+  document.getElementById('btnXplus').addEventListener('click',  () => jog('X',  10));
+  document.getElementById('btnYminus').addEventListener('click', () => jog('Y', -10));
+  document.getElementById('btnYplus').addEventListener('click',  () => jog('Y',  10));
 </script>
 </body>
 </html>
