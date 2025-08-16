@@ -351,6 +351,16 @@ def jog(axis: str, delta_mm: float, feed_xy: int = 1200) -> Dict[str, Any]:
     f = int(feed_xy)
     seq = ["G91", f"G0 {axis}{d:.3f} F{f}", "G90"]
     return send(seq)
+def goto_xy(x_mm: float, y_mm: float, safe_lift: bool = True) -> Dict[str, Any]:
+    """
+    Travel to absolute XY. If safe_lift, raise to safe Z first.
+    """
+    _ensure_ready()
+    seq = ["G90"]
+    if safe_lift and _cfg.safe_z_mm is not None:
+        seq.append(f"G0 Z{float(_cfg.safe_z_mm):.3f} F{_cfg.travel_feed_z}")
+    seq.append(f"G0 X{float(x_mm):.3f} Y{float(y_mm):.3f} F{_cfg.travel_feed_xy}")
+    return send(seq)
 
 
 # =============================================================================
