@@ -372,11 +372,26 @@ async def get_capture(capture_id: int = FPath(..., ge=1)):
     if not row:
         raise HTTPException(status_code=404, detail="Capture not found")
     return row
-    @app.get("/ocr")
+@app.get("/ocr")
 def ocr_endpoint():
-    image_path = camera.capture_image()
-    detected_text = ocr.run_ocr(image_path)
-    return {"image": image_path, "text": detected_text}
+    """
+    Capture an image, run OCR, and return the detected text.
+    """
+    try:
+        # Capture an image
+        img_path = camera.capture()
+
+        # Run OCR
+        text = ocr.extract_text(img_path)
+
+        # Log and return the result
+        logger.info(f"OCR detected text: {text}")
+        return JSONResponse(content={"success": True, "text": text, "image": img_path})
+    except Exception as e:
+        logger.error(f"OCR endpoint failed: {e}", exc_info=True)
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+
+
 
 @app.post("/capture", response_model=CaptureResponse)
 async def do_capture(background_tasks: BackgroundTasks) -> CaptureResponse:
