@@ -9,7 +9,7 @@ motion:
   # Serial connection
   port: "/dev/ttyACM0"        # e.g., /dev/ttyACM0, /dev/ttyUSB0 (Linux) | COM3 (Windows)
   baud: 250000
-  enabled: false              # app starts with motion disabled; enable via API/UI
+  enabled: true              # app starts with motion disabled; enable via API/UI
   read_timeout_s: 2.0
   write_timeout_s: 2.0
   connect_timeout_s: 6.0
