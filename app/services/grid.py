@@ -2,6 +2,14 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+# in any file under app/services/ that needs models
+from .. import models
+# examples inside app/services/*.py
+from . import motion
+from . import plunger
+from . import grid
+from . import assign
+
 
 @dataclass(frozen=True)
 class Zone:
