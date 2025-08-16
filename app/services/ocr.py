@@ -20,13 +20,12 @@ logger = logging.getLogger("ocr")
 
 @dataclass
 class OCRState:
-    # engine/config
     engine: str = "tesseract"
     lang: str = "eng"
-    psm: int = 7                           # single text line (good for names/titles at top)
+    psm: int = 7                           # single line bias (top-name strip)
     whitelist: Optional[str] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'-. "
 
-    # preprocessing/toggles
+    # preprocessing
     enable_deskew: bool = True
     gamma: float = 1.1
     denoise: bool = True
@@ -35,18 +34,14 @@ class OCRState:
     invert_if_needed: bool = True
     otsu_fallback: bool = True
 
-    # ROI band (percentages of full image width/height)
-    # default: top 22% height; trim 5% from left/right to avoid borders
-    roi_top_pct: float = 0.00
-    roi_height_pct: float = 0.22
-    roi_left_pct: float = 0.05
-    roi_right_pct: float = 0.95
-
-    # rotations to test (degrees). Cards may be 0 or 180.
+    # orientation attempts (we explicitly want 0 and 180)
     rotations: Tuple[int, int] = (0, 180)
 
-    # min width for OCR (ROI upscaled if smaller)
+    # upscale small ROIs so OCR has enough pixels
     min_ocr_width: int = 900
+
+    # fixed policy: OCR only the top third of the (possibly rotated) image
+    top_fraction: float = 1.0 / 3.0
 
     initialized: bool = False
 
@@ -60,19 +55,17 @@ _state = OCRState()
 
 def init(cfg: Dict[str, Any]) -> None:
     """
-    Initialize the OCR module with configuration from main.py / config.yaml.
-    Extra supported keys under `ocr:` in config.yaml:
-      psm: 7
-      whitelist: "ABC..."
-      roi: { top_pct: 0.00, height_pct: 0.22, left_pct: 0.05, right_pct: 0.95 }
-      rotations: [0, 180]
-      gamma: 1.1
-      ...
+    Initialize OCR module. We always crop the *top third* after rotation.
+    Optional config keys honored:
+      engine, lang, psm, whitelist,
+      enable_deskew, gamma, denoise, unsharp, adaptive_thresh, invert_if_needed, otsu_fallback,
+      rotations (e.g., [0, 180]), min_ocr_width
     """
     global _state
     _state.engine = str(cfg.get("engine", _state.engine))
     _state.lang = str(cfg.get("lang", _state.lang))
     _state.psm = int(cfg.get("psm", _state.psm))
+
     wl = cfg.get("whitelist", _state.whitelist)
     _state.whitelist = None if wl in (None, "", "null", "None") else str(wl)
 
@@ -83,12 +76,6 @@ def init(cfg: Dict[str, Any]) -> None:
     _state.adaptive_thresh = bool(cfg.get("adaptive_thresh", _state.adaptive_thresh))
     _state.invert_if_needed = bool(cfg.get("invert_if_needed", _state.invert_if_needed))
     _state.otsu_fallback = bool(cfg.get("otsu_fallback", _state.otsu_fallback))
-
-    roi_cfg = cfg.get("roi", {}) or {}
-    _state.roi_top_pct = float(roi_cfg.get("top_pct", _state.roi_top_pct))
-    _state.roi_height_pct = float(roi_cfg.get("height_pct", _state.roi_height_pct))
-    _state.roi_left_pct = float(roi_cfg.get("left_pct", _state.roi_left_pct))
-    _state.roi_right_pct = float(roi_cfg.get("right_pct", _state.roi_right_pct))
 
     rots = cfg.get("rotations", _state.rotations)
     if isinstance(rots, (list, tuple)) and rots:
@@ -109,9 +96,8 @@ def init(cfg: Dict[str, Any]) -> None:
 
     _state.initialized = True
     logger.info(
-        "OCR initialized: engine=%s, lang=%s, psm=%d, rotations=%s, roi(top/height/left/right)=%.2f/%.2f/%.2f/%.2f",
-        _state.engine, _state.lang, _state.psm, _state.rotations,
-        _state.roi_top_pct, _state.roi_height_pct, _state.roi_left_pct, _state.roi_right_pct
+        "OCR initialized: engine=%s, lang=%s, psm=%d, rotations=%s, policy=top-third",
+        _state.engine, _state.lang, _state.psm, _state.rotations
     )
 
 
@@ -121,15 +107,15 @@ def status() -> bool:
 
 def run(image_path: str) -> Dict[str, Any]:
     """
-    Execute OCR on the given image path focusing on the top-band ROI and choosing the best
-    among configured rotations (e.g., 0 and 180 deg).
-    Returns: {
-      'text': str,
-      'confidence': int,
-      'boxes': {...},
-      'rotation': int,
-      'roi_px': [x1,y1,x2,y2]
-    }
+    Read the entire image, evaluate 0° and 180°, then OCR the *top third* of the rotated image.
+    Returns:
+      {
+        'text': str,
+        'confidence': int,
+        'boxes': {...},
+        'rotation': int,       # 0 or 180
+        'roi_px': [x1,y1,x2,y2]
+      }
     """
     if not _state.initialized:
         raise RuntimeError("OCR not initialized")
@@ -138,40 +124,38 @@ def run(image_path: str) -> Dict[str, Any]:
     if img_bgr is None:
         raise RuntimeError(f"Failed to read image: {image_path}")
 
-    h, w = img_bgr.shape[:2]
-    x1, y1, x2, y2 = _roi_rect_px(w, h, _state)
-    best = {"confidence": -1, "text": "", "data": {}, "rotation": 0}
+    best = {"confidence": -1, "text": "", "data": {}, "rotation": 0, "roi": (0, 0, 0, 0)}
 
     for rot in _state.rotations:
         rotated = _rotate_bound_color(img_bgr, rot) if rot != 0 else img_bgr
-        # recompute ROI after rotation because dims change
+        # Crop top third after rotation
         hr, wr = rotated.shape[:2]
-        rx1, ry1, rx2, ry2 = _roi_rect_px(wr, hr, _state)
-        roi = rotated[ry1:ry2, rx1:rx2].copy()
+        x1, y1, x2, y2 = _top_third_rect_px(wr, hr, _state.top_fraction)
+        roi = rotated[y1:y2, x1:x2].copy()
 
+        # Preprocess ROI for OCR
         proc = _preprocess(roi, _state)
 
+        # Tesseract
         text, data = _run_tesseract(proc, _state)
 
-        # Extract a single "best" line: longest alnum-heavy line
+        # Choose the "best" line candidate
         text_lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if text_lines:
-            text_pick = max(text_lines, key=lambda s: (_alpha_ratio(s), len(s)))
-        else:
-            text_pick = text.strip()
-
+        pick = max(text_lines, key=lambda s: (_alpha_ratio(s), len(s))) if text_lines else text.strip()
         conf = int(max(0, min(100, data.get("confidence", 0))))
-        # Favor results with higher alpha ratio when confidences tie
-        tiebreak = (_alpha_ratio(text_pick), conf)
-        if (conf > best["confidence"]) or (conf == best["confidence"] and tiebreak > (_alpha_ratio(best["text"]), best["confidence"])):
-            best = {"confidence": conf, "text": text_pick, "data": data, "rotation": rot, "roi": (rx1, ry1, rx2, ry2)}
+
+        # prefer higher confidence; break ties by alpha ratio + length
+        tie_cur = (_alpha_ratio(pick), conf)
+        tie_best = (_alpha_ratio(best["text"]), best["confidence"])
+        if (conf > best["confidence"]) or (conf == best["confidence"] and tie_cur > tie_best):
+            best = {"confidence": conf, "text": pick, "data": data, "rotation": rot, "roi": (x1, y1, x2, y2)}
 
     result = {
         "text": best["text"].replace("\r", " ").strip(),
         "confidence": int(best["confidence"]),
         "boxes": best["data"].get("boxes", {}),
         "rotation": int(best["rotation"]),
-        "roi_px": list(best.get("roi", (x1, y1, x2, y2))),
+        "roi_px": list(best.get("roi", (0, 0, 0, 0))),
     }
     return result
 
@@ -186,13 +170,13 @@ def _preprocess(img_bgr: np.ndarray, st: OCRState) -> np.ndarray:
     """
     img = img_bgr.copy()
 
-    # Resize up to min width if necessary (helps Tesseract)
+    # Ensure sufficient width for OCR
     h, w = img.shape[:2]
     if w < st.min_ocr_width:
         scale = st.min_ocr_width / float(max(1, w))
         img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
 
-    # Gamma
+    # Gamma correction
     if st.gamma and abs(st.gamma - 1.0) > 1e-3:
         try:
             inv_gamma = 1.0 / max(1e-3, st.gamma)
@@ -208,7 +192,7 @@ def _preprocess(img_bgr: np.ndarray, st: OCRState) -> np.ndarray:
     if st.denoise:
         gray = cv2.bilateralFilter(gray, d=7, sigmaColor=50, sigmaSpace=50)
 
-    # Optional deskew (Hough-based)
+    # Deskew
     if st.enable_deskew:
         try:
             angle = _estimate_skew_angle(gray)
@@ -217,7 +201,7 @@ def _preprocess(img_bgr: np.ndarray, st: OCRState) -> np.ndarray:
         except Exception:
             logger.debug("Deskew skipped", exc_info=True)
 
-    # Unsharp
+    # Unsharp masking
     if st.unsharp:
         try:
             blur = cv2.GaussianBlur(gray, (0, 0), 1.0)
@@ -255,9 +239,8 @@ def _preprocess(img_bgr: np.ndarray, st: OCRState) -> np.ndarray:
 
 def _run_tesseract(img: np.ndarray, st: OCRState) -> Tuple[str, Dict[str, Any]]:
     """
-    Run tesseract safely with PSM and whitelist tuned for single-line OCR.
+    Run tesseract with single-line bias and optional whitelist.
     """
-    # Build config tokens
     tokens: List[str] = [f"--psm {int(getattr(st, 'psm', 7))}"]
     wl = getattr(st, "whitelist", None)
     if wl:
@@ -303,18 +286,15 @@ def _run_tesseract(img: np.ndarray, st: OCRState) -> Tuple[str, Dict[str, Any]]:
 # Utilities
 # =========================
 
+def _top_third_rect_px(w: int, h: int, top_fraction: float) -> Tuple[int, int, int, int]:
+    """Return rectangle covering the top `top_fraction` of the image."""
+    top_fraction = max(0.05, min(0.5, float(top_fraction)))  # guardrails: between 5% and 50%
+    y2 = int(round(h * top_fraction))
+    return 0, 0, w, max(1, y2)
+
 def _quote_tess_value(val: str) -> str:
     # Safe for shlex in pytesseract
     return '"' + val.replace('\\', '\\\\').replace('"', '\\"') + '"'
-
-def _roi_rect_px(w: int, h: int, st: OCRState) -> Tuple[int, int, int, int]:
-    left = int(max(0.0, min(1.0, st.roi_left_pct)) * w)
-    right = int(max(0.0, min(1.0, st.roi_right_pct)) * w)
-    top = int(max(0.0, min(1.0, st.roi_top_pct)) * h)
-    height = int(max(0.0, min(1.0, st.roi_height_pct)) * h)
-    bottom = min(h, top + max(1, height))
-    left, right = min(left, right-1), max(left+1, right)
-    return left, top, right, bottom
 
 def _alpha_ratio(s: str) -> float:
     if not s:
@@ -374,5 +354,9 @@ def _estimate_confidence(text: str) -> int:
     letters = sum(ch.isalnum() for ch in t)
     ratio = letters / max(1, len(t))
     base = 35 + int(60 * ratio)
-    length_bonus = min(10, int(math.log10(max(10, len(t))) * 8))
+    length_bonus = 0
+    try:
+        length_bonus = min(10, int(math.log10(max(10, len(t))) * 8))
+    except Exception:
+        pass
     return int(max(0, min(100, base + length_bonus)))
