@@ -134,67 +134,88 @@ OCR_RUNS: Dict[str, Dict[str, Any]] = {}  # ocr_id -> result payload
 # -----------------------------------------------------------------------------
 # Startup / Shutdown
 # -----------------------------------------------------------------------------
+# --- put near the top with other imports ---
+from typing import Optional, Tuple, List, Dict
+
 def _auto_connect_motion(config_motion) -> None:
     """
-    Try to connect to a motion serial port *only if* enabled and ports exist.
-    Preference order:
-      1) Exact match on configured motion.port
-      2) If exactly one port exists, use it
-      3) Otherwise, skip silently
+    Politely try to connect when motion.enabled is true.
+    Match order: by-id substring -> VID:PID -> configured port -> only port.
+    Assumes motion.list_ports() returns a LIST[DICT].
     """
     try:
-        if not bool(config_motion.enabled):
-            return  # user wants it disabled at boot
+        if not bool(getattr(config_motion, "enabled", False)):
+            return
 
-        ports = motion.list_ports()
+        ports: List[Dict[str, str]] = motion.list_ports()  # LIST now
         if not ports:
-            # Nothing plugged in yet; skip without warning
             log.info("Motion auto-connect skipped: no serial ports present.")
             return
 
-        # Try the configured port first
-        configured = str(config_motion.port or "").strip()
-        selected: Tuple[str, int] | None = None
+        by_id_sub = (getattr(config_motion, "by_id_contains", None) or "").strip().lower()
+        want_vid = (getattr(config_motion, "vid", None) or "").strip().lower()
+        want_pid = (getattr(config_motion, "pid", None) or "").strip().lower()
+        conf_dev = (getattr(config_motion, "port", "") or "").strip()
+        baud = int(getattr(config_motion, "baud", 250000))
 
-        if configured:
+        selected: Optional[Tuple[str, int]] = None
+
+        # 1) by-id contains
+        if by_id_sub:
             for p in ports:
-                if p.get("device") == configured:
-                    selected = (configured, int(config_motion.baud))
+                if by_id_sub in (p.get("by_id") or "").lower():
+                    selected = ((p.get("by_id") or p.get("device")), baud)
+                    log.info("Motion auto-connect: matched by by-id: %s", selected[0])
                     break
 
-        # If no exact match and exactly one port is present, take it
+        # 2) VID/PID exact
+        if selected is None and want_vid and want_pid:
+            for p in ports:
+                if p.get("vid", "").lower() == want_vid and p.get("pid", "").lower() == want_pid:
+                    selected = (p["device"], baud)
+                    log.info("Motion auto-connect: matched by VID:PID %s:%s -> %s", want_vid, want_pid, p["device"])
+                    break
+
+        # 3) Configured device
+        if selected is None and conf_dev:
+            for p in ports:
+                if p.get("device") == conf_dev:
+                    selected = (conf_dev, baud)
+                    log.info("Motion auto-connect: using configured port %s", conf_dev)
+                    break
+
+        # 4) Only one present
         if selected is None and len(ports) == 1:
-            only = ports[0].get("device")
+            only = ports[0].get("by_id") or ports[0].get("device")
             if only:
-                log.info("Motion auto-connect: using the only available port: %s", only)
-                selected = (only, int(config_motion.baud))
+                selected = (only, baud)
+                log.info("Motion auto-connect: single available port -> %s", only)
 
         if selected is None:
-            # Multiple ports or configured one missing; do nothing
-            devs = ", ".join(p.get("device", "?") for p in ports)
-            log.info("Motion auto-connect skipped: multiple ports present (%s) or configured port not found.", devs)
+            devs = ", ".join([(p.get("by_id") or p.get("device", "?")) for p in ports])
+            log.info("Motion auto-connect skipped: multiple ports (%s) or no match.", devs)
             return
 
-        port, baud = selected
-        # Ensure motion service is enabled & connected
+        port, bd = selected
         motion.enable()
-        motion.connect(port=port, baud=baud)
-        # Optional sanity ping
+        motion.connect(port=port, baud=bd)
+
+        # Optional probe (ignore failures)
         try:
-            resp = motion.ping()
-            log.info("Motion auto-connect success on %s @ %d: %s", port, baud, resp.get("response", [])[:1])
+            probe = motion.ping()
+            first = (probe.get("lines") or probe.get("response") or [])[:1]
+            log.info("Motion auto-connect OK on %s @ %d; probe: %s", port, bd, first)
         except Exception:
-            log.info("Motion auto-connect connected on %s but ping failed (this can be normal on some firmwares).", port)
+            log.info("Motion auto-connect connected on %s; ping failed (may still be fine).", port)
 
     except Exception as e:
-        # Keep it informational; don't fail app startup
-        log.info("Motion auto-connect skipped: %s", e)
-
+        # Important: do NOT say list has no attribute get again
+        log.info(f"Motion auto-connect skipped (helper error): {e}")
 @app.on_event("startup")
 async def on_startup() -> None:
     log.info("Starting %s v%s", APP_NAME, APP_VERSION)
 
-    # Camera
+    # --- Camera ---
     try:
         camera.init(
             device=CONFIG.camera.device,
@@ -204,6 +225,7 @@ async def on_startup() -> None:
             preview_fps=CONFIG.camera.preview_fps,
         )
     except TypeError:
+        # fallback to dict-style init if your camera service expects a single config object
         camera.init({
             "device": CONFIG.camera.device,
             "backend": CONFIG.camera.backend,
@@ -211,6 +233,39 @@ async def on_startup() -> None:
             "captures_dir": str(CAPTURES_DIR),
             "preview_fps": CONFIG.camera.preview_fps,
         })
+    except Exception as e:
+        # Do not crash the app; surface clear error
+        log.error("Camera init failed: %s", e, exc_info=True)
+
+    # --- OCR ---
+    try:
+        ocr.init(cfg=CONFIG.ocr.dict())
+    except Exception as e:
+        log.error("OCR init failed: %s", e, exc_info=True)
+
+    # --- Motion (init only; connection is polite and non-fatal) ---
+    try:
+        motion.init(CONFIG.motion.dict())
+    except Exception as e:
+        log.error("Motion init failed: %s", e, exc_info=True)
+
+    # --- Polite auto-connect with short retry window (10s total) ---
+    try:
+        # Try immediately
+        _auto_connect_motion(CONFIG.motion)
+
+        # If not connected yet, retry once per second up to 10s to catch late USB enumeration
+        for _ in range(10):
+            if hasattr(motion, "is_connected") and motion.is_connected():
+                break
+            await asyncio.sleep(1.0)
+            _auto_connect_motion(CONFIG.motion)
+    except Exception as e:
+        # Never fail startup on motion issues
+        log.info("Motion auto-connect: retry loop skipped due to error: %s", e)
+
+    log.info("Startup complete")
+
 
     # OCR
     ocr.init(cfg=CONFIG.ocr.dict())
