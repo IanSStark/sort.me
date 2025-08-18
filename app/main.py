@@ -1,6 +1,7 @@
 # app/main.py
 from __future__ import annotations
 
+from typing import Tuple
 import asyncio
 import logging
 import os
@@ -133,12 +134,67 @@ OCR_RUNS: Dict[str, Dict[str, Any]] = {}  # ocr_id -> result payload
 # -----------------------------------------------------------------------------
 # Startup / Shutdown
 # -----------------------------------------------------------------------------
+def _auto_connect_motion(config_motion) -> None:
+    """
+    Try to connect to a motion serial port *only if* enabled and ports exist.
+    Preference order:
+      1) Exact match on configured motion.port
+      2) If exactly one port exists, use it
+      3) Otherwise, skip silently
+    """
+    try:
+        if not bool(config_motion.enabled):
+            return  # user wants it disabled at boot
+
+        ports = motion.list_ports()
+        if not ports:
+            # Nothing plugged in yet; skip without warning
+            log.info("Motion auto-connect skipped: no serial ports present.")
+            return
+
+        # Try the configured port first
+        configured = str(config_motion.port or "").strip()
+        selected: Tuple[str, int] | None = None
+
+        if configured:
+            for p in ports:
+                if p.get("device") == configured:
+                    selected = (configured, int(config_motion.baud))
+                    break
+
+        # If no exact match and exactly one port is present, take it
+        if selected is None and len(ports) == 1:
+            only = ports[0].get("device")
+            if only:
+                log.info("Motion auto-connect: using the only available port: %s", only)
+                selected = (only, int(config_motion.baud))
+
+        if selected is None:
+            # Multiple ports or configured one missing; do nothing
+            devs = ", ".join(p.get("device", "?") for p in ports)
+            log.info("Motion auto-connect skipped: multiple ports present (%s) or configured port not found.", devs)
+            return
+
+        port, baud = selected
+        # Ensure motion service is enabled & connected
+        motion.enable()
+        motion.connect(port=port, baud=baud)
+        # Optional sanity ping
+        try:
+            resp = motion.ping()
+            log.info("Motion auto-connect success on %s @ %d: %s", port, baud, resp.get("response", [])[:1])
+        except Exception:
+            log.info("Motion auto-connect connected on %s but ping failed (this can be normal on some firmwares).", port)
+
+    except Exception as e:
+        # Keep it informational; don't fail app startup
+        log.info("Motion auto-connect skipped: %s", e)
 
 @app.on_event("startup")
 async def on_startup() -> None:
     log.info("Starting %s v%s", APP_NAME, APP_VERSION)
 
-    # Initialize services
+    # Camera
     try:
         camera.init(
             device=CONFIG.camera.device,
@@ -148,7 +204,6 @@ async def on_startup() -> None:
             preview_fps=CONFIG.camera.preview_fps,
         )
     except TypeError:
-        # Fallback if your camera.init takes a single dict
         camera.init({
             "device": CONFIG.camera.device,
             "backend": CONFIG.camera.backend,
@@ -157,12 +212,17 @@ async def on_startup() -> None:
             "preview_fps": CONFIG.camera.preview_fps,
         })
 
+    # OCR
     ocr.init(cfg=CONFIG.ocr.dict())
 
+    # Motion (init only; connection handled by helper)
     motion.init(CONFIG.motion.dict())
-    # Do not auto-enable/connect; leave that to explicit UI actions
+
+    # Attempt a *polite* auto-connect (won't warn if no ports)
+    _auto_connect_motion(CONFIG.motion)
 
     log.info("Startup complete")
+
 @app.on_event("startup")
 async def on_startup():
     # ... your existing startup logic (load config, init camera/ocr, motion.init(...), etc.)
