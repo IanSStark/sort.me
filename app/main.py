@@ -296,43 +296,104 @@ async def on_startup():
 
 
 # --- Add this helper after you call motion.init(...) in main.py ---
-def _auto_motion_bringup(cfg):
+def _auto_motion_bringup(cfg) -> None:
     """
     Try to connect and enable motion on startup.
     Uses cfg.motion.port/baud if present; otherwise picks the first available port.
-    Never raises (logs warnings instead) so the app still starts if the board is offline.
+    Never raises—logs warnings so the app still starts if the board is offline.
     """
     try:
-        ports_info = motion.list_ports().get("ports", [])
-        # Candidate port from config (if provided)
-        preferred = (getattr(cfg, "motion", None) or {}).get("port", None) if isinstance(cfg.motion, dict) \
-                    else getattr(cfg.motion, "port", None)
-        baud = (getattr(cfg, "motion", None) or {}).get("baud", 250000) if isinstance(cfg.motion, dict) \
-               else getattr(cfg.motion, "baud", 250000)
+        ports_info = motion.list_ports()                  # <-- this is already a LIST[DICT]
+        if not isinstance(ports_info, list):
+            # Defensive: normalize accidental shapes
+            ports_info = list(ports_info or [])
 
-        # Normalize available devices
-        avail = [p.get("device") for p in ports_info if p.get("device")]
+        # Read configured values from the Pydantic model
+        preferred = (cfg.motion.port or "").strip() if getattr(cfg, "motion", None) else ""
+        baud = int(getattr(cfg.motion, "baud", 250000)) if getattr(cfg, "motion", None) else 250000
+
+        # Flatten available device paths
+        avail = []
+        for p in ports_info:
+            if not isinstance(p, dict):
+                continue
+            dev = (p.get("by_id") or p.get("device") or "").strip()
+            if dev:
+                avail.append(dev)
+
         if not avail:
-            logger.warning("Motion auto-connect: no serial ports found.")
+            logger.info("Motion auto-connect: no serial ports found.")
             return
 
-        # Pick a port: use preferred if it is in the list; else first available
         use_port = preferred if preferred in avail else avail[0]
         if preferred and preferred not in avail:
-            logger.warning("Motion auto-connect: preferred port %s not found; using %s", preferred, use_port)
+            logger.info("Motion auto-connect: preferred %s not found; using %s", preferred, use_port)
 
-        motion.connect(port=use_port, baud=baud)
+        motion.init(cfg.motion.dict())      # idempotent; safe if already called
         motion.enable()
+        motion.connect(port=use_port, baud=baud)
+
+        # Optional probe; non-fatal if firmware doesn’t respond
         try:
             motion.ping()
         except Exception as e:
-            # Not fatal; some firmware may not respond to M115 as expected
-            logger.warning("Motion auto-connect: ping warning: %s", e)
+            logger.info("Motion auto-connect: connected on %s @ %d; ping warn: %s", use_port, baud, e)
 
-        logger.info("Motion auto-connect: connected on %s @ %s and enabled.", use_port, baud)
+        logger.info("Motion auto-connect: connected on %s @ %d and enabled.", use_port, baud)
 
     except Exception as e:
         logger.warning("Motion auto-connect failed: %s", e)
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    log.info("Starting %s v%s", APP_NAME, APP_VERSION)
+
+    # Camera
+    try:
+        camera.init(
+            device=CONFIG.camera.device,
+            backend=CONFIG.camera.backend,
+            resolution=tuple(CONFIG.camera.resolution) if CONFIG.camera.resolution else None,
+            captures_dir=str(CAPTURES_DIR),
+            preview_fps=CONFIG.camera.preview_fps,
+        )
+    except TypeError:
+        camera.init({
+            "device": CONFIG.camera.device,
+            "backend": CONFIG.camera.backend,
+            "resolution": CONFIG.camera.resolution,
+            "captures_dir": str(CAPTURES_DIR),
+            "preview_fps": CONFIG.camera.preview_fps,
+        })
+    except Exception as e:
+        log.error("Camera init failed: %s", e, exc_info=True)
+
+    # OCR
+    try:
+        ocr.init(cfg=CONFIG.ocr.dict())
+    except Exception as e:
+        log.error("OCR init failed: %s", e, exc_info=True)
+
+    # Motion (init; connection handled by helper)
+    try:
+        motion.init(CONFIG.motion.dict())
+    except Exception as e:
+        log.error("Motion init failed: %s", e, exc_info=True)
+
+    # Try immediate auto-connect; if not present yet, retry briefly to catch late enumeration
+    try:
+        _auto_motion_bringup(CONFIG)
+        for _ in range(10):
+            if hasattr(motion, "is_connected") and motion.is_connected():
+                break
+            await asyncio.sleep(1.0)
+            _auto_motion_bringup(CONFIG)
+    except Exception as e:
+        log.info("Motion auto-connect retry loop skipped due to error: %s", e)
+
+    log.info("Startup complete")
+
+
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
     try:
