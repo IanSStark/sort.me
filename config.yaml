@@ -6,10 +6,14 @@
 # MOTION (MPCNC running Marlin)
 # --------
 motion:
-  # Serial connection
-  port: "/dev/ttyACM0"        # e.g., /dev/ttyACM0, /dev/ttyUSB0 (Linux) | COM3 (Windows)
+  enabled: true
   baud: 250000
-  enabled: false              # app starts with motion disabled; enable via API/UI
+  # any (or none) of these:
+  by_id_contains: "usb-Marlin"   # substring of /dev/serial/by-id/*
+  vid: "0483"                    # example: STMicroelectronics
+  pid: "5740"
+  port: "/dev/ttyACM0"           # fallback
+          # app starts with motion disabled; enable via API/UI
   read_timeout_s: 2.0
   write_timeout_s: 2.0
   connect_timeout_s: 6.0
