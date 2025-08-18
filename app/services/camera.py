@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
-import cv2  # Used for encoding/saving even with Picamera2
+import cv2
 
 logger = logging.getLogger("camera")
 
@@ -41,7 +41,9 @@ _JPEG_QUALITY = 92
 
 def init(
     device: Optional[str] = None,
+    backend: Optional[str] = None,
     resolution: Tuple[int, int] = (1280, 720),
+    captures_dir: Optional[str] = None,
     preview_fps: int = 5,
 ) -> None:
     """
@@ -50,24 +52,31 @@ def init(
     Args:
         device: If None, prefer Picamera2; else force OpenCV/V4L2.
                 Accepts '/dev/videoX' or an integer index as a string.
+        backend: Optional explicit backend: "picamera2" or "opencv".
         resolution: (width, height) request.
+        captures_dir: directory to store captured stills.
         preview_fps: Target FPS for preview/streaming (best effort).
     """
     global _BACKEND, _picam2, _picam2_started, _opencv_cap
-    global _cfg_device, _cfg_resolution, _cfg_preview_fps
+    global _cfg_device, _cfg_resolution, _cfg_preview_fps, _CAPTURES_DIR
 
     with _LOCK:
         if _BACKEND is not None:
             logger.info("camera.init(): backend already initialized: %s", _BACKEND)
             return
 
+        if captures_dir:
+            _CAPTURES_DIR = Path(captures_dir)
+
         _CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
         _cfg_device = _coerce_device(device)
         _cfg_resolution = (int(resolution[0]), int(resolution[1]))
         _cfg_preview_fps = int(preview_fps)
 
-        # Try Picamera2 unless user forces a V4L2 node/index
-        if _should_try_picamera2(_cfg_device):
+        # Decide backend
+        forced = (backend or "").strip().lower() or None
+
+        if forced == "picamera2" or (forced is None and _should_try_picamera2(_cfg_device)):
             try:
                 from picamera2 import Picamera2  # type: ignore
                 _picam2 = Picamera2()
@@ -117,40 +126,75 @@ def capture() -> str:
         raise RuntimeError("Unknown camera backend")
 
 
-def grab_jpeg() -> bytes:
+def get_frame():
     """
-    Return a single JPEG frame (bytes) without saving to disk.
-    Useful for snapshot endpoints and MJPEG streaming.
+    Return a single BGR frame (numpy ndarray) or None.
+    Used by the stream fallback when JPEG bytes aren't provided directly.
     """
     with _LOCK:
-        if _BACKEND is None:
-            raise RuntimeError("Camera not initialized")
-
         if _BACKEND == "picamera2":
-            assert _picam2 is not None
+            if _picam2 is None:
+                return None
             frame = _picam2.capture_array()
             if frame is None:
-                raise RuntimeError("Picamera2 returned empty frame")
-            if frame.shape[-1] == 3:  # RGB -> BGR for OpenCV encoding
+                return None
+            # Picamera2 gives RGB; convert to BGR for OpenCV/JPEG encode
+            if frame.shape[-1] == 3:
                 frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), _JPEG_QUALITY])
-            if not ok:
-                raise RuntimeError("JPEG encoding failed (Picamera2)")
-            return buf.tobytes()
+            return frame
 
-        if _BACKEND == "opencv":
-            assert _opencv_cap is not None
+        if _BACKEND == "opencv" and _opencv_cap is not None:
             # small warm-up to stabilize auto-exposure
             _opencv_cap.read()
             ok, frame = _opencv_cap.read()
-            if not ok or frame is None:
-                raise RuntimeError("OpenCV grab failed")
-            ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), _JPEG_QUALITY])
-            if not ok:
-                raise RuntimeError("JPEG encoding failed (OpenCV)")
-            return buf.tobytes()
+            return frame if ok else None
 
-        raise RuntimeError("Unknown camera backend")
+        return None
+
+
+def get_jpeg_frame() -> Optional[bytes]:
+    """
+    Return a single JPEG frame (bytes) without saving to disk, or None on failure.
+    Preferred by the MJPEG route to avoid re-encoding work elsewhere.
+    """
+    frame = get_frame()
+    if frame is None:
+        return None
+    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), _JPEG_QUALITY])
+    if not ok:
+        return None
+    return bytes(buf)
+
+
+def mjpeg_stream():
+    """
+    Native MJPEG generator. Each yielded chunk is a valid multipart part:
+      --frame\r\n
+      Content-Type: image/jpeg\r\n
+      Content-Length: <n>\r\n
+      \r\n
+      <JPEG bytes>\r\n
+    """
+    boundary = b"--frame"
+    while True:
+        try:
+            jpg = get_jpeg_frame()
+            if not jpg:
+                time.sleep(0.05)
+                continue
+
+            yield (
+                boundary + b"\r\n"
+                b"Content-Type: image/jpeg\r\n"
+                b"Content-Length: " + str(len(jpg)).encode() + b"\r\n"
+                b"\r\n" + jpg + b"\r\n"
+            )
+            time.sleep(0.05)  # ~20 fps target
+        except GeneratorExit:
+            break
+        except Exception:
+            # transient issue; keep streaming
+            time.sleep(0.2)
 
 
 def shutdown() -> None:
@@ -207,7 +251,7 @@ def _should_try_picamera2(device: Optional[Union[int, str]]) -> bool:
 
 def _configure_picamera2(p2, resolution: Tuple[int, int], preview_fps: int) -> None:
     """
-    Configure Picamera2 for still capture at the requested resolution.
+    Configure Picamera2 for still/preview at the requested resolution.
     """
     w, h = int(resolution[0]), int(resolution[1])
     cfg = p2.create_still_configuration(main={"size": (w, h)}, buffer_count=2)
