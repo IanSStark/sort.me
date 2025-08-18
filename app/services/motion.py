@@ -1,12 +1,14 @@
 # app/services/motion.py
 from __future__ import annotations
 
+import glob
 import logging
+import os
 import threading
 import time
 import uuid
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 import serial  # pyserial
 import serial.tools.list_ports
@@ -15,26 +17,29 @@ logger = logging.getLogger("motion")
 
 
 # =============================================================================
-# Configuration dataclass
+# Configuration
 # =============================================================================
 
 @dataclass
 class MotionConfig:
+    # Basics
     port: str = "/dev/ttyACM0"
     baud: int = 250000
     enabled: bool = False
 
+    # Timeouts / behavior
     read_timeout_s: float = 2.0
     write_timeout_s: float = 2.0
     connect_timeout_s: float = 6.0
-
     reset_on_connect: bool = True
     startup_drain_s: float = 2.0
 
-    ok_tokens: List[str] = None
-    error_tokens: List[str] = None
-    busy_tokens: List[str] = None
+    # Protocol parsing
+    ok_tokens: List[str] = field(default_factory=lambda: ["ok"])
+    error_tokens: List[str] = field(default_factory=lambda: ["error", "Error:"])
+    busy_tokens: List[str] = field(default_factory=lambda: ["busy:", "wait"])
 
+    # Simple motion helpers (kept for compatibility)
     absolute_mode: bool = True
     safe_z_mm: float = 5.0
     travel_feed_xy: int = 1800
@@ -43,36 +48,30 @@ class MotionConfig:
     home_on_start: bool = False
     home_axes: str = "XY"
 
-    standby_pos: Optional[Dict[str, float]] = None  # {"x":0.0,"y":0.0,"z":10.0}
+    standby_pos: Optional[Dict[str, float]] = None  # {"x":..,"y":..,"z":..}
+    test_square: Dict[str, Any] = field(default_factory=lambda: {"size_mm": 20.0, "feed_xy": 1200})
 
-    test_square: Dict[str, Any] = None  # {"size_mm":20.0,"feed_xy":1200}
-
-    def __post_init__(self):
-        if self.ok_tokens is None:
-            self.ok_tokens = ["ok"]
-        if self.error_tokens is None:
-            self.error_tokens = ["error", "Error:"]
-        if self.busy_tokens is None:
-            self.busy_tokens = ["busy:", "wait"]
-        if self.test_square is None:
-            self.test_square = {"size_mm": 20.0, "feed_xy": 1200}
+    # ---- New selectors for robust auto-connect ----
+    by_id_contains: Optional[str] = None   # substring of /dev/serial/by-id/* symlink
+    vid: Optional[str] = None              # e.g. "1a86"
+    pid: Optional[str] = None              # e.g. "7523"
 
 
 # =============================================================================
-# Module global state
+# Module state
 # =============================================================================
 
 _cfg = MotionConfig()
 _initialized = False
+_enabled = False
 
 _ser: Optional[serial.Serial] = None
 _lock = threading.RLock()
 _connected = False
-_enabled = False
 
 
 # =============================================================================
-# Helpers
+# Utilities
 # =============================================================================
 
 def _ensure_initialized():
@@ -82,21 +81,27 @@ def _ensure_initialized():
 def _ensure_ready():
     if not _enabled:
         raise RuntimeError("Motion disabled. Call /motion/enable first.")
-    if not _connected or _ser is None or not _ser.is_open:
+    if not is_connected():
         raise RuntimeError("Motion not connected. Call /motion/connect first.")
 
 def _drain_startup(ser: serial.Serial, seconds: float):
-    """Read and discard any banner or buffered output right after opening the port."""
+    """
+    Read and discard banner text / residual bytes after open or reset.
+    """
     end = time.time() + max(0.0, seconds)
-    ser.timeout = 0.1
-    while time.time() < end:
-        try:
-            data = ser.read(ser.in_waiting or 1)
-            if not data:
-                time.sleep(0.02)
-                continue
-        except Exception:
-            break
+    prev_to = ser.timeout
+    try:
+        ser.timeout = 0.1
+        while time.time() < end:
+            try:
+                data = ser.read(ser.in_waiting or 1)
+                if not data:
+                    time.sleep(0.02)
+                    continue
+            except Exception:
+                break
+    finally:
+        ser.timeout = prev_to
 
 
 # =============================================================================
@@ -105,12 +110,11 @@ def _drain_startup(ser: serial.Serial, seconds: float):
 
 def init(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Initialize motion service from config.yaml values.
-    This does not open the port; use connect()/enable() when ready.
+    Initialize from config.yaml values. Does NOT open the port.
     """
     global _cfg, _initialized, _enabled
 
-    # Rebuild config while preserving defaults
+    # Rebuild config with safe defaults
     _cfg = MotionConfig(
         port=str(cfg.get("port", _cfg.port)),
         baud=int(cfg.get("baud", _cfg.baud)),
@@ -131,30 +135,62 @@ def init(cfg: Dict[str, Any]) -> Dict[str, Any]:
         home_axes=str(cfg.get("home_axes", _cfg.home_axes)),
         standby_pos=cfg.get("standby_pos", _cfg.standby_pos),
         test_square=cfg.get("test_square", _cfg.test_square),
+        by_id_contains=(str(cfg["by_id_contains"]).strip() if cfg.get("by_id_contains") else None),
+        vid=(str(cfg["vid"]).lower().strip() if cfg.get("vid") else None),
+        pid=(str(cfg["pid"]).lower().strip() if cfg.get("pid") else None),
     )
 
     _initialized = True
     _enabled = _cfg.enabled
-
     logger.info("Motion initialized with: %s", _cfg)
     return {"status": "initialized", "enabled": _enabled, "port": _cfg.port, "baud": _cfg.baud}
 
 
 def list_ports() -> Dict[str, Any]:
-    """Enumerate serial ports the host can see."""
+    """
+    Enumerate serial ports with rich metadata for matching.
+    """
     ports = []
     for p in serial.tools.list_ports.comports():
-        ports.append({"device": p.device, "name": p.name, "hwid": p.hwid})
+        by_id = ""
+        try:
+            for link in glob.glob("/dev/serial/by-id/*"):
+                if os.path.realpath(link) == p.device:
+                    by_id = link
+                    break
+        except Exception:
+            pass
+
+        ports.append({
+            "device": p.device,
+            "by_id": by_id,
+            "name": p.name or "",
+            "description": p.description or "",
+            "manufacturer": getattr(p, "manufacturer", "") or "",
+            "product": getattr(p, "product", "") or "",
+            "serial_number": getattr(p, "serial_number", "") or "",
+            "hwid": p.hwid or "",
+            "vid": f"{p.vid:04x}" if p.vid is not None else "",
+            "pid": f"{p.pid:04x}" if p.pid is not None else "",
+        })
     return {"ports": ports}
 
 
+def is_connected() -> bool:
+    with _lock:
+        return bool(_connected and _ser is not None and _ser.is_open)
+
+
 def connect(port: Optional[str] = None, baud: Optional[int] = None) -> Dict[str, Any]:
-    """Open the serial port to the controller and drain the startup banner."""
+    """
+    Open the serial port and drain the startup banner.
+    """
     _ensure_initialized()
     global _ser, _connected
 
     with _lock:
-        if _ser and _ser.is_open:
+        # Close any existing
+        if _ser:
             try:
                 _ser.close()
             except Exception:
@@ -163,9 +199,9 @@ def connect(port: Optional[str] = None, baud: Optional[int] = None) -> Dict[str,
             _connected = False
 
         use_port = port or _cfg.port
-        use_baud = baud or _cfg.baud
+        use_baud = int(baud or _cfg.baud)
 
-        logger.info("Opening serial port %s @ %s", use_port, use_baud)
+        logger.info("Opening serial port %s @ %d", use_port, use_baud)
         ser = serial.Serial(
             port=use_port,
             baudrate=use_baud,
@@ -176,7 +212,7 @@ def connect(port: Optional[str] = None, baud: Optional[int] = None) -> Dict[str,
             xonxoff=False,
         )
 
-        # Toggle DTR/RTS if requested (some boards reset on DTR)
+        # Optional reset pulse
         if _cfg.reset_on_connect:
             try:
                 ser.dtr = False
@@ -187,13 +223,13 @@ def connect(port: Optional[str] = None, baud: Optional[int] = None) -> Dict[str,
             except Exception as e:
                 logger.debug("DTR/RTS toggle unsupported: %s", e)
 
-        # Drain banner / buffer
+        # Drain any startup text
         _drain_startup(ser, _cfg.startup_drain_s)
 
         _ser = ser
         _connected = True
 
-        # Optionally send a homing sequence once at connect
+        # Optional one-shot homing
         if _cfg.home_on_start:
             try:
                 home(_cfg.home_axes)
@@ -203,19 +239,61 @@ def connect(port: Optional[str] = None, baud: Optional[int] = None) -> Dict[str,
     return {"status": "connected", "port": use_port, "baud": use_baud}
 
 
+def auto_connect() -> Dict[str, Any]:
+    """
+    Attempt to auto-select a port using (by-id substring) → (VID/PID) → (configured port) → (only port).
+    Returns {'connected': True/False, 'port': <port or ''>, 'reason': <text>}
+    """
+    _ensure_initialized()
+
+    ports_info = list_ports()["ports"]
+    if not ports_info:
+        return {"connected": False, "port": "", "reason": "no ports present"}
+
+    # 1) by-id substring
+    if _cfg.by_id_contains:
+        needle = _cfg.by_id_contains.lower()
+        for p in ports_info:
+            by_id = (p.get("by_id") or "").lower()
+            if needle in by_id:
+                res = connect(port=p["by_id"] or p["device"], baud=_cfg.baud)
+                return {"connected": True, "port": res["port"], "reason": "matched by by-id"}
+
+    # 2) VID/PID exact
+    if _cfg.vid and _cfg.pid:
+        for p in ports_info:
+            if p.get("vid", "").lower() == _cfg.vid and p.get("pid", "").lower() == _cfg.pid:
+                res = connect(port=p["device"], baud=_cfg.baud)
+                return {"connected": True, "port": res["port"], "reason": "matched by vid:pid"}
+
+    # 3) Configured device
+    if _cfg.port:
+        for p in ports_info:
+            if p.get("device") == _cfg.port:
+                res = connect(port=_cfg.port, baud=_cfg.baud)
+                return {"connected": True, "port": res["port"], "reason": "matched configured port"}
+
+    # 4) Only one port available
+    if len(ports_info) == 1:
+        p = ports_info[0]
+        res = connect(port=p["by_id"] or p["device"], baud=_cfg.baud)
+        return {"connected": True, "port": res["port"], "reason": "single available port"}
+
+    # Otherwise skip (multiple ports; ambiguous)
+    return {"connected": False, "port": "", "reason": "multiple ports; no unique match"}
+
+
 def enable() -> Dict[str, Any]:
     _ensure_initialized()
     global _enabled
     _enabled = True
     return {"status": "enabled"}
 
-
 def disable() -> Dict[str, Any]:
     _ensure_initialized()
     global _enabled
     _enabled = False
     return {"status": "disabled"}
-
 
 def close() -> Dict[str, Any]:
     """Close the serial port if open."""
@@ -231,7 +309,7 @@ def close() -> Dict[str, Any]:
 
 
 # =============================================================================
-# Core send-and-wait logic
+# Send / receive
 # =============================================================================
 
 def _write_line(ser: serial.Serial, line: str):
@@ -241,8 +319,7 @@ def _write_line(ser: serial.Serial, line: str):
 
 def _read_until_ok_or_error(ser: serial.Serial) -> List[str]:
     """
-    Read response lines until we encounter an OK (success) or Error token.
-    Busy/info tokens are logged and ignored while we continue waiting.
+    Read lines until OK or Error appears. Busy/info lines are collected and ignored.
     """
     lines: List[str] = []
     deadline = time.time() + max(1.0, _cfg.connect_timeout_s)
@@ -256,29 +333,26 @@ def _read_until_ok_or_error(ser: serial.Serial) -> List[str]:
             continue
 
         text = raw.decode("utf-8", errors="replace").strip()
-        if text:
-            lines.append(text)
-            low = text.lower()
+        if not text:
+            continue
 
-            # Error?
-            if any(tok in low for tok in map(str.lower, _cfg.error_tokens)):
-                raise RuntimeError(f"Firmware reported error: {text}")
+        lines.append(text)
+        low = text.lower()
 
-            # Busy/info — keep waiting
-            if any(tok in low for tok in map(str.lower, _cfg.busy_tokens)):
-                continue
+        if any(tok in low for tok in map(str.lower, _cfg.error_tokens)):
+            raise RuntimeError(f"Firmware reported error: {text}")
 
-            # OK?
-            if any(tok in low for tok in map(str.lower, _cfg.ok_tokens)):
-                break
+        if any(tok in low for tok in map(str.lower, _cfg.busy_tokens)):
+            continue
+
+        if any(tok in low for tok in map(str.lower, _cfg.ok_tokens)):
+            break
 
     return lines
 
-
 def send(gcode_lines: List[str]) -> Dict[str, Any]:
     """
-    Send one or more G-code lines and wait for 'ok' after each line.
-    Returns a move_id that the UI can display and a list of response lines.
+    Send one or more G-code lines, waiting for 'ok' after each.
     """
     _ensure_ready()
     if not gcode_lines:
@@ -289,17 +363,10 @@ def send(gcode_lines: List[str]) -> Dict[str, Any]:
 
     with _lock:
         assert _ser is not None
-        for idx, ln in enumerate(gcode_lines, start=1):
-            line = ln.strip()
-            if not line:
-                continue
-            _write_line(_ser, line)
-            try:
-                lines = _read_until_ok_or_error(_ser)
-            except Exception as e:
-                logger.error("Error after sending '%s': %s", line, e)
-                raise
-            responses.append({"line": line, "reply": lines})
+        for ln in [l for l in gcode_lines if l and l.strip()]:
+            _write_line(_ser, ln)
+            lines = _read_until_ok_or_error(_ser)
+            responses.append({"line": ln.strip(), "reply": lines})
 
     return {"move_id": move_id, "lines": responses}
 
@@ -318,42 +385,32 @@ def home(axes: str = "XY") -> Dict[str, Any]:
     On Marlin, 'G28 X Y' homes X and Y; 'G28' homes all.
     """
     axes = (axes or "").upper()
-    cmd = "G28" if axes == "" or axes == "XYZ" else f"G28 {' '.join(list(axes))}"
+    cmd = "G28" if axes in ("", "XYZ") else f"G28 {' '.join(list(axes))}"
     return send([cmd])
 
 def test_square(size_mm: float = None, feed_xy: int = None) -> Dict[str, Any]:
     """
-    Draw a small square in the XY plane, starting at current position.
-    Uses relative mode to avoid dependency on work offsets.
+    Draw a square in the XY plane (relative mode) starting at the current position.
     """
     size = float(size_mm if size_mm is not None else _cfg.test_square.get("size_mm", 20.0))
     feed = int(feed_xy if feed_xy is not None else _cfg.test_square.get("feed_xy", 1200))
-
-    seq = [
-        "G91",                        # relative
-        f"G0 X{size:.3f} F{feed}",    # +X
-        f"G0 Y{size:.3f} F{feed}",    # +Y
-        f"G0 X{-size:.3f} F{feed}",   # -X
-        f"G0 Y{-size:.3f} F{feed}",   # -Y
-        "G90",                        # absolute
-    ]
+    seq = ["G91", f"G0 X{size:.3f} F{feed}", f"G0 Y{size:.3f} F{feed}",
+           f"G0 X{-size:.3f} F{feed}", f"G0 Y{-size:.3f} F{feed}", "G90"]
     return send(seq)
 
 def jog(axis: str, delta_mm: float, feed_xy: int = 1200) -> Dict[str, Any]:
     """
-    Relative jog on a single axis, then return to absolute mode.
-    Example: jog('X', 10) → G91; G0 X10 F1200; G90
+    Relative jog on a single axis, then return to absolute.
     """
     axis = (axis or "").upper().strip()
     if axis not in ("X", "Y", "Z"):
         raise ValueError("axis must be one of X, Y, Z")
-    d = float(delta_mm)
-    f = int(feed_xy)
-    seq = ["G91", f"G0 {axis}{d:.3f} F{f}", "G90"]
-    return send(seq)
+    d = float(delta_mm); f = int(feed_xy)
+    return send(["G91", f"G0 {axis}{d:.3f} F{f}", "G90"])
+
 def goto_xy(x_mm: float, y_mm: float, safe_lift: bool = True) -> Dict[str, Any]:
     """
-    Travel to absolute XY. If safe_lift, raise to safe Z first.
+    Absolute XY travel with optional safe Z lift first.
     """
     _ensure_ready()
     seq = ["G90"]
@@ -361,11 +418,6 @@ def goto_xy(x_mm: float, y_mm: float, safe_lift: bool = True) -> Dict[str, Any]:
         seq.append(f"G0 Z{float(_cfg.safe_z_mm):.3f} F{_cfg.travel_feed_z}")
     seq.append(f"G0 X{float(x_mm):.3f} Y{float(y_mm):.3f} F{_cfg.travel_feed_xy}")
     return send(seq)
-
-
-# =============================================================================
-# Optional helpers for planned motion (standby, safe Z)
-# =============================================================================
 
 def go_standby() -> Optional[Dict[str, Any]]:
     if not _cfg.standby_pos:
