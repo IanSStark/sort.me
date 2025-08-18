@@ -256,13 +256,81 @@ def _camera_stream_gen():
         return camera.stream()
     raise RuntimeError("Camera service does not provide an MJPEG stream generator")
 
+def _fallback_stream():
+    """
+    Fallback MJPEG generator if the camera service doesn't expose an MJPEG stream generator.
+    It tries:
+      - camera.get_jpeg_frame() -> bytes
+      - camera.get_frame() -> np.ndarray (BGR), which we JPEG-encode
+    """
+    import cv2
+    boundary = b"--frame"
+    while True:
+        try:
+            # Preferred: service returns JPEG bytes directly
+            if hasattr(camera, "get_jpeg_frame"):
+                jpg = camera.get_jpeg_frame()  # must be bytes
+                if not isinstance(jpg, (bytes, bytearray)):
+                    raise RuntimeError("camera.get_jpeg_frame must return bytes")
+            else:
+                # Try raw frame then encode
+                if not hasattr(camera, "get_frame"):
+                    # Nothing available; back off
+                    time.sleep(0.2)
+                    continue
+                frame = camera.get_frame()  # np.ndarray (BGR)
+                if frame is None:
+                    time.sleep(0.02)
+                    continue
+                ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                if not ok:
+                    time.sleep(0.02)
+                    continue
+                jpg = bytes(buf)
+
+            # Emit a compliant MJPEG part
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n"
+                b"Content-Length: " + str(len(jpg)).encode() + b"\r\n"
+                b"\r\n" + jpg + b"\r\n"
+            )
+            time.sleep(0.05)  # ~20 fps
+        except GeneratorExit:
+            break
+        except Exception:
+            # transient failure; keep streaming
+            time.sleep(0.2)
+
+def _mjpeg_source():
+    # Prefer a native generator if the service provides one
+    if hasattr(camera, "mjpeg_stream"):
+        gen = camera.mjpeg_stream()
+        if gen is not None:
+            return gen
+    if hasattr(camera, "stream"):
+        gen = camera.stream()
+        if gen is not None:
+            return gen
+    # else build one
+    return _fallback_stream()
+
 @app.get("/camera/stream")
 def camera_stream():
     try:
-        gen = _camera_stream_gen()
-        return StreamingResponse(gen, media_type="multipart/x-mixed-replace; boundary=frame")
+        gen = _mjpeg_source()
+        headers = {
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Connection": "close",
+        }
+        return StreamingResponse(
+            gen,
+            media_type="multipart/x-mixed-replace; boundary=frame",
+            headers=headers,
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"camera stream error: {e}")
 
 @app.get("/camera/capture")
 def camera_capture():
