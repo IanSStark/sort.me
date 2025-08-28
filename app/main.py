@@ -1,58 +1,42 @@
 # app/main.py
 from __future__ import annotations
 
-from typing import Tuple
 import asyncio
 import logging
-import os
-import sys
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, BaseSettings, Field, validator
+from pydantic import BaseModel, BaseSettings, Field
 
-# Services
-from app.services import camera, ocr, motion
-import logging
-logger = logging.getLogger("uvicorn.error")  # or your preferred logger
-
-# app/main.py
-from . import models
-from .services import assign, camera, grid as grid_svc, motion, plunger
-# if you have an OCR module:
-from .services import ocr  # only if services/ocr.py exists
-
-
-GRID: grid_svc.Grid | None = None
+# Local services
+from .services import camera, ocr, motion, plunger, assign, grid as grid_svc  # services live under app/services
+from . import models  # optional DB helpers
 
 # -----------------------------------------------------------------------------
 # App metadata / logging
 # -----------------------------------------------------------------------------
-
 APP_NAME = "Card Sorter"
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.6.0"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
-log = logging.getLogger("Card Sorter")
+log = logging.getLogger(APP_NAME)
 
 # -----------------------------------------------------------------------------
 # Config models
 # -----------------------------------------------------------------------------
-
 class CameraConfig(BaseModel):
-    # Accept whatever your camera service expects; typical fields shown
     device: Optional[str] = None
     backend: Optional[str] = None
-    resolution: Optional[List[int]] = None   # [width, height]
-    preview_fps: Optional[int] = None
+    resolution: Optional[List[int]] = None   # [w,h]
+    preview_fps: Optional[int] = 10
     captures_dir: str = "captures"
 
 class OCRConfig(BaseModel):
@@ -61,8 +45,6 @@ class OCRConfig(BaseModel):
     psm: int = 6
     oem: int = 1
     whitelist: Optional[str] = None
-
-    # If your ocr.py exposes stricter selection/acceptance knobs, include them:
     min_accept_confidence: Optional[int] = 75
     top_priority_fraction: Optional[float] = 0.35
     top_bias_bonus: Optional[float] = 10.0
@@ -80,33 +62,45 @@ class MotionConfig(BaseModel):
     ok_tokens: List[str] = ["ok"]
     error_tokens: List[str] = ["error", "Error:"]
     busy_tokens: List[str] = ["busy:", "wait"]
+    # Optional selectors and convenience params (passed through if present in YAML)
+    by_id_contains: Optional[str] = None
+    vid: Optional[str] = None
+    pid: Optional[str] = None
+    absolute_mode: Optional[bool] = None
+    safe_z_mm: Optional[float] = None
+    travel_feed_xy: Optional[int] = None
+    travel_feed_z: Optional[int] = None
+    home_on_start: Optional[bool] = None
+    home_axes: Optional[str] = None
+    standby_pos: Optional[Dict[str, float]] = None
+    test_square: Optional[Dict[str, Any]] = None
 
 class AppConfig(BaseSettings):
     camera: CameraConfig = Field(default_factory=CameraConfig)
     ocr: OCRConfig = Field(default_factory=OCRConfig)
     motion: MotionConfig = Field(default_factory=MotionConfig)
 
-    # (optional) explicitly capture other sections so you can read them later
-    assignment: Optional[Dict[str, Any]] = None
-    cors: Optional[Dict[str, Any]] = None
+    # pass-through sections so we can forward them to services
     grid: Optional[Dict[str, Any]] = None
-    logging: Optional[Dict[str, Any]] = None
     plunger: Optional[Dict[str, Any]] = None
+    assignment: Optional[Dict[str, Any]] = None
     server: Optional[Dict[str, Any]] = None
+    cors: Optional[Dict[str, Any]] = None
+    logging: Optional[Dict[str, Any]] = None
 
     class Config:
-        extra = "allow"          # <- accept unknown top-level keys
+        extra = "allow"
         case_sensitive = False
 
 # -----------------------------------------------------------------------------
 # Load config.yaml
 # -----------------------------------------------------------------------------
-
 def load_config() -> AppConfig:
+    # config.yaml one level up from this file (project root /app/config.yaml)
     cfg_path = Path(__file__).resolve().parent.parent / "config.yaml"
     if not cfg_path.exists():
-        log.warning("config.yaml not found at %s, using defaults", cfg_path)
-        return AppConfig()  # all defaults
+        log.warning("config.yaml not found at %s; using defaults", cfg_path)
+        return AppConfig()
     with cfg_path.open("r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
     try:
@@ -116,509 +110,279 @@ def load_config() -> AppConfig:
 
 CONFIG: AppConfig = load_config()
 
-# Ensure captures directory exists
-CAPTURES_DIR = Path(CONFIG.camera.captures_dir).resolve()
-CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
-
 # -----------------------------------------------------------------------------
-# App + templates
+# Globals & framework
 # -----------------------------------------------------------------------------
-
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 templates = Jinja2Templates(directory=str(Path(__file__).resolve().parent / "templates"))
 
-# In-memory registries for IDs returned to the UI
-CAPTURES: Dict[str, str] = {}     # capture_id -> file path
-OCR_RUNS: Dict[str, Dict[str, Any]] = {}  # ocr_id -> result payload
+# Runtime helpers
+GRID: Optional[grid_svc.Grid] = None
+CAPTURES: Dict[str, str] = {}              # capture_id -> absolute image path
+OCR_RUNS: Dict[str, Dict[str, Any]] = {}   # ocr_id -> result dict
+
+# Derived motion convenience with sane defaults if YAML omitted these
+_DEF_SAFE_Z = float(CONFIG.motion.safe_z_mm if CONFIG.motion.safe_z_mm is not None else 5.0)
+_DEF_FEED_XY = int(CONFIG.motion.travel_feed_xy if CONFIG.motion.travel_feed_xy is not None else 1800)
+_DEF_FEED_Z  = int(CONFIG.motion.travel_feed_z  if CONFIG.motion.travel_feed_z  is not None else 600)
 
 # -----------------------------------------------------------------------------
 # Startup / Shutdown
 # -----------------------------------------------------------------------------
-# --- put near the top with other imports ---
-from typing import Optional, Tuple, List, Dict
-
-def _auto_connect_motion(config_motion) -> None:
+def _auto_connect_motion() -> None:
     """
-    Politely try to connect when motion.enabled is true.
-    Match order: by-id substring -> VID:PID -> configured port -> only port.
-    Assumes motion.list_ports() returns a LIST[DICT].
+    Attempt a polite auto-connect based on by-id substring, VID/PID, or configured port.
+    Never raises.
     """
     try:
-        if not bool(getattr(config_motion, "enabled", False)):
+        if not CONFIG.motion.enabled:
             return
 
-        ports: List[Dict[str, str]] = motion.list_ports()  # LIST now
+        ports = motion.list_ports()  # returns LIST[DICT] (device metadata)  :contentReference[oaicite:7]{index=7}
         if not ports:
-            log.info("Motion auto-connect skipped: no serial ports present.")
+            log.info("Motion auto-connect: no serial ports present.")
             return
 
-        by_id_sub = (getattr(config_motion, "by_id_contains", None) or "").strip().lower()
-        want_vid = (getattr(config_motion, "vid", None) or "").strip().lower()
-        want_pid = (getattr(config_motion, "pid", None) or "").strip().lower()
-        conf_dev = (getattr(config_motion, "port", "") or "").strip()
-        baud = int(getattr(config_motion, "baud", 250000))
+        by_id_sub = (CONFIG.motion.by_id_contains or "").strip().lower()
+        want_vid = (CONFIG.motion.vid or "").strip().lower()
+        want_pid = (CONFIG.motion.pid or "").strip().lower()
+        conf_dev = (CONFIG.motion.port or "").strip()
+        baud = int(CONFIG.motion.baud or 250000)
 
-        selected: Optional[Tuple[str, int]] = None
+        def pick() -> Optional[Tuple[str, int]]:
+            # 1) by-id contains
+            if by_id_sub:
+                for p in ports:
+                    if by_id_sub in (p.get("by_id") or "").lower():
+                        return ((p.get("by_id") or p.get("device")), baud)
+            # 2) VID/PID exact
+            if want_vid and want_pid:
+                for p in ports:
+                    if p.get("vid", "").lower() == want_vid and p.get("pid", "").lower() == want_pid:
+                        return (p["device"], baud)
+            # 3) configured device if present in list
+            if conf_dev:
+                for p in ports:
+                    if p.get("device") == conf_dev:
+                        return (conf_dev, baud)
+            # 4) single available
+            if len(ports) == 1:
+                only = ports[0].get("by_id") or ports[0].get("device")
+                if only:
+                    return (only, baud)
+            # 5) fallback to first
+            if ports:
+                return (ports[0].get("device"), baud)
+            return None
 
-        # 1) by-id contains
-        if by_id_sub:
-            for p in ports:
-                if by_id_sub in (p.get("by_id") or "").lower():
-                    selected = ((p.get("by_id") or p.get("device")), baud)
-                    log.info("Motion auto-connect: matched by by-id: %s", selected[0])
-                    break
-
-        # 2) VID/PID exact
-        if selected is None and want_vid and want_pid:
-            for p in ports:
-                if p.get("vid", "").lower() == want_vid and p.get("pid", "").lower() == want_pid:
-                    selected = (p["device"], baud)
-                    log.info("Motion auto-connect: matched by VID:PID %s:%s -> %s", want_vid, want_pid, p["device"])
-                    break
-
-        # 3) Configured device
-        if selected is None and conf_dev:
-            for p in ports:
-                if p.get("device") == conf_dev:
-                    selected = (conf_dev, baud)
-                    log.info("Motion auto-connect: using configured port %s", conf_dev)
-                    break
-
-        # 4) Only one present
-        if selected is None and len(ports) == 1:
-            only = ports[0].get("by_id") or ports[0].get("device")
-            if only:
-                selected = (only, baud)
-                log.info("Motion auto-connect: single available port -> %s", only)
-
-        if selected is None:
-            devs = ", ".join([(p.get("by_id") or p.get("device", "?")) for p in ports])
-            log.info("Motion auto-connect skipped: multiple ports (%s) or no match.", devs)
+        chosen = pick()
+        if not chosen:
+            log.info("Motion auto-connect: no suitable port selection.")
             return
 
-        port, bd = selected
+        port, bd = chosen
         motion.enable()
-        motion.connect(port=port, baud=bd)
-
-        # Optional probe (ignore failures)
+        motion.connect(port=port, baud=bd)  # open serial & drain banner  :contentReference[oaicite:8]{index=8}
         try:
-            probe = motion.ping()
-            first = (probe.get("lines") or probe.get("response") or [])[:1]
-            log.info("Motion auto-connect OK on %s @ %d; probe: %s", port, bd, first)
+            motion.ping()  # optional probe; ignore failures
         except Exception:
-            log.info("Motion auto-connect connected on %s; ping failed (may still be fine).", port)
-
+            pass
+        log.info("Motion auto-connect OK: %s @ %d", port, bd)
     except Exception as e:
-        # Important: do NOT say list has no attribute get again
-        log.info(f"Motion auto-connect skipped (helper error): {e}")
+        log.info("Motion auto-connect skipped: %s", e)
+
 @app.on_event("startup")
 async def on_startup() -> None:
     log.info("Starting %s v%s", APP_NAME, APP_VERSION)
 
-    # --- Camera ---
+    # Initialize DB (optional, safe if unused)
     try:
-        camera.init(
-            device=CONFIG.camera.device,
-            backend=CONFIG.camera.backend,
-            resolution=tuple(CONFIG.camera.resolution) if CONFIG.camera.resolution else None,
-            captures_dir=str(CAPTURES_DIR),
-            preview_fps=CONFIG.camera.preview_fps,
-        )
-    except TypeError:
-        # fallback to dict-style init if your camera service expects a single config object
-        camera.init({
-            "device": CONFIG.camera.device,
-            "backend": CONFIG.camera.backend,
-            "resolution": CONFIG.camera.resolution,
-            "captures_dir": str(CAPTURES_DIR),
-            "preview_fps": CONFIG.camera.preview_fps,
-        })
+        models.init_db()  # creates tables if needed  :contentReference[oaicite:9]{index=9}
     except Exception as e:
-        # Do not crash the app; surface clear error
-        log.error("Camera init failed: %s", e, exc_info=True)
+        log.info("DB init skipped: %s", e)
 
-    # --- OCR ---
+    # Build GRID from YAML
     try:
-        ocr.init(cfg=CONFIG.ocr.dict())
+        global GRID
+        GRID = grid_svc.Grid(CONFIG.grid or {})  # grid math & zones  :contentReference[oaicite:10]{index=10}
     except Exception as e:
-        log.error("OCR init failed: %s", e, exc_info=True)
-
-    # --- Motion (init only; connection is polite and non-fatal) ---
-    try:
-        motion.init(CONFIG.motion.dict())
-    except Exception as e:
-        log.error("Motion init failed: %s", e, exc_info=True)
-
-    # --- Polite auto-connect with short retry window (10s total) ---
-    try:
-        # Try immediately
-        _auto_connect_motion(CONFIG.motion)
-
-        # If not connected yet, retry once per second up to 10s to catch late USB enumeration
-        for _ in range(10):
-            if hasattr(motion, "is_connected") and motion.is_connected():
-                break
-            await asyncio.sleep(1.0)
-            _auto_connect_motion(CONFIG.motion)
-    except Exception as e:
-        # Never fail startup on motion issues
-        log.info("Motion auto-connect: retry loop skipped due to error: %s", e)
-
-    log.info("Startup complete")
-
-
-    # OCR
-    ocr.init(cfg=CONFIG.ocr.dict())
-
-    # Motion (init only; connection handled by helper)
-    motion.init(CONFIG.motion.dict())
-
-    # Attempt a *polite* auto-connect (won't warn if no ports)
-    _auto_connect_motion(CONFIG.motion)
-
-    log.info("Startup complete")
-
-@app.on_event("startup")
-async def on_startup():
-    # ... your existing startup logic (load config, init camera/ocr, motion.init(...), etc.)
-    try:
-        _auto_motion_bringup(CONFIG)  # CONFIG is whatever var holds your loaded AppConfig
-    except Exception as e:
-        # Shouldn't happen since the helper already guards, but keep this belt-and-suspenders
-        logger.warning("Startup: auto motion bring-up wrapper caught: %s", e)
-
-@app.on_event("startup")
-async def on_startup():
-    # ... your existing startup code ...
-    global GRID
-    GRID = grid_svc.Grid(CONFIG.grid)
-    # keep your existing auto-connect/enable bring-up
-
-
-# --- Add this helper after you call motion.init(...) in main.py ---
-def _auto_motion_bringup(cfg) -> None:
-    """
-    Try to connect and enable motion on startup.
-    Uses cfg.motion.port/baud if present; otherwise picks the first available port.
-    Never raises—logs warnings so the app still starts if the board is offline.
-    """
-    try:
-        ports_info = motion.list_ports()                  # <-- this is already a LIST[DICT]
-        if not isinstance(ports_info, list):
-            # Defensive: normalize accidental shapes
-            ports_info = list(ports_info or [])
-
-        # Read configured values from the Pydantic model
-        preferred = (cfg.motion.port or "").strip() if getattr(cfg, "motion", None) else ""
-        baud = int(getattr(cfg.motion, "baud", 250000)) if getattr(cfg, "motion", None) else 250000
-
-        # Flatten available device paths
-        avail = []
-        for p in ports_info:
-            if not isinstance(p, dict):
-                continue
-            dev = (p.get("by_id") or p.get("device") or "").strip()
-            if dev:
-                avail.append(dev)
-
-        if not avail:
-            logger.info("Motion auto-connect: no serial ports found.")
-            return
-
-        use_port = preferred if preferred in avail else avail[0]
-        if preferred and preferred not in avail:
-            logger.info("Motion auto-connect: preferred %s not found; using %s", preferred, use_port)
-
-        motion.init(cfg.motion.dict())      # idempotent; safe if already called
-        motion.enable()
-        motion.connect(port=use_port, baud=baud)
-
-        # Optional probe; non-fatal if firmware doesn’t respond
-        try:
-            motion.ping()
-        except Exception as e:
-            logger.info("Motion auto-connect: connected on %s @ %d; ping warn: %s", use_port, baud, e)
-
-        logger.info("Motion auto-connect: connected on %s @ %d and enabled.", use_port, baud)
-
-    except Exception as e:
-        logger.warning("Motion auto-connect failed: %s", e)
-
-@app.on_event("startup")
-async def on_startup() -> None:
-    log.info("Starting %s v%s", APP_NAME, APP_VERSION)
+        raise RuntimeError(f"Grid initialization failed: {e}")
 
     # Camera
     try:
         camera.init(
             device=CONFIG.camera.device,
             backend=CONFIG.camera.backend,
-            resolution=tuple(CONFIG.camera.resolution) if CONFIG.camera.resolution else None,
-            captures_dir=str(CAPTURES_DIR),
-            preview_fps=CONFIG.camera.preview_fps,
-        )
-    except TypeError:
-        camera.init({
-            "device": CONFIG.camera.device,
-            "backend": CONFIG.camera.backend,
-            "resolution": CONFIG.camera.resolution,
-            "captures_dir": str(CAPTURES_DIR),
-            "preview_fps": CONFIG.camera.preview_fps,
-        })
+            resolution=tuple(CONFIG.camera.resolution) if CONFIG.camera.resolution else (1280, 720),
+            captures_dir=CONFIG.camera.captures_dir,
+            preview_fps=CONFIG.camera.preview_fps or 10,
+        )  # camera service  :contentReference[oaicite:11]{index=11}
+        log.info("Camera initialized.")
     except Exception as e:
         log.error("Camera init failed: %s", e, exc_info=True)
 
     # OCR
     try:
-        ocr.init(cfg=CONFIG.ocr.dict())
+        ocr.init(cfg=CONFIG.ocr.dict())  # OCR engine init  :contentReference[oaicite:12]{index=12}
+        log.info("OCR initialized.")
     except Exception as e:
         log.error("OCR init failed: %s", e, exc_info=True)
 
-    # Motion (init; connection handled by helper)
+    # Motion (configure; do not fail app if board is absent)
     try:
-        motion.init(CONFIG.motion.dict())
+        motion.init(CONFIG.motion.dict())  # serial & firmware settings  :contentReference[oaicite:13]{index=13}
+        _auto_connect_motion()
     except Exception as e:
-        log.error("Motion init failed: %s", e, exc_info=True)
+        log.info("Motion init skipped: %s", e)
 
-    # Try immediate auto-connect; if not present yet, retry briefly to catch late enumeration
+    # Plunger (GPIO/stepper for vacuum/testing)
     try:
-        _auto_motion_bringup(CONFIG)
-        for _ in range(10):
-            if hasattr(motion, "is_connected") and motion.is_connected():
-                break
-            await asyncio.sleep(1.0)
-            _auto_motion_bringup(CONFIG)
+        plunger.init(CONFIG.plunger or {})  # GPIO backend selection  :contentReference[oaicite:14]{index=14}
     except Exception as e:
-        log.info("Motion auto-connect retry loop skipped due to error: %s", e)
+        log.info("Plunger init skipped: %s", e)
 
-    log.info("Startup complete")
-
+    log.info("Startup complete.")
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
     try:
-        motion.disconnect()
+        camera.shutdown()
     except Exception:
         pass
+    try:
+        plunger.shutdown()
+    except Exception:
+        pass
+    try:
+        motion.close()
+    except Exception:
+        pass
+    log.info("Shutdown complete.")
 
 # -----------------------------------------------------------------------------
-# Templated UI
+# Small travel planner (absolute XY with optional Z safe-lift) via G-code
 # -----------------------------------------------------------------------------
+def _plan_xy_move_gcode(x_mm: float, y_mm: float, safe_lift: bool = True) -> List[str]:
+    """
+    Compose a safe absolute XY travel using plain G-code, independent of motion helpers.
+    """
+    g: List[str] = []
+    g.append("G90")  # absolute
+    if safe_lift and _DEF_SAFE_Z > 0:
+        g += ["G91", f"G0 Z{_DEF_SAFE_Z:.3f} F{_DEF_FEED_Z}", "G90"]
+    g.append(f"G0 X{float(x_mm):.3f} Y{float(y_mm):.3f} F{_DEF_FEED_XY}")
+    return g
 
+# -----------------------------------------------------------------------------
+# UI & Templating
+# -----------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> HTMLResponse:
-    return templates.TemplateResponse(
-        "index.html",
-        {
-            "request": request,
-            "app_name": APP_NAME,
-            "version": APP_VERSION,
-        },
-    )
+    return templates.TemplateResponse("index.html", {"request": request, "app_name": APP_NAME, "version": APP_VERSION})
 
 # -----------------------------------------------------------------------------
 # Camera endpoints
 # -----------------------------------------------------------------------------
-
-def _camera_stream_gen():
-    """
-    Use the camera service's MJPEG generator. Supports either:
-      - camera.mjpeg_stream()
-      - camera.stream()
-    """
-    if hasattr(camera, "mjpeg_stream"):
-        return camera.mjpeg_stream()
-    if hasattr(camera, "stream"):
-        return camera.stream()
-    raise RuntimeError("Camera service does not provide an MJPEG stream generator")
-
-def _fallback_stream():
-    """
-    Fallback MJPEG generator if the camera service doesn't expose an MJPEG stream generator.
-    It tries:
-      - camera.get_jpeg_frame() -> bytes
-      - camera.get_frame() -> np.ndarray (BGR), which we JPEG-encode
-    """
-    import cv2
-    boundary = b"--frame"
-    while True:
-        try:
-            # Preferred: service returns JPEG bytes directly
-            if hasattr(camera, "get_jpeg_frame"):
-                jpg = camera.get_jpeg_frame()  # must be bytes
-                if not isinstance(jpg, (bytes, bytearray)):
-                    raise RuntimeError("camera.get_jpeg_frame must return bytes")
-            else:
-                # Try raw frame then encode
-                if not hasattr(camera, "get_frame"):
-                    # Nothing available; back off
-                    time.sleep(0.2)
-                    continue
-                frame = camera.get_frame()  # np.ndarray (BGR)
-                if frame is None:
-                    time.sleep(0.02)
-                    continue
-                ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-                if not ok:
-                    time.sleep(0.02)
-                    continue
-                jpg = bytes(buf)
-
-            # Emit a compliant MJPEG part
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n"
-                b"Content-Length: " + str(len(jpg)).encode() + b"\r\n"
-                b"\r\n" + jpg + b"\r\n"
-            )
-            time.sleep(0.05)  # ~20 fps
-        except GeneratorExit:
-            break
-        except Exception:
-            # transient failure; keep streaming
-            time.sleep(0.2)
-
-def _mjpeg_source():
-    # Prefer a native generator if the service provides one
-    if hasattr(camera, "mjpeg_stream"):
-        gen = camera.mjpeg_stream()
-        if gen is not None:
-            return gen
-    if hasattr(camera, "stream"):
-        gen = camera.stream()
-        if gen is not None:
-            return gen
-    # else build one
-    return _fallback_stream()
-
 @app.get("/camera/stream")
 def camera_stream():
     try:
-        gen = _mjpeg_source()
-        headers = {
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache",
-            "Connection": "close",
-        }
-        return StreamingResponse(
-            gen,
-            media_type="multipart/x-mixed-replace; boundary=frame",
-            headers=headers,
-        )
+        gen = camera.mjpeg_stream()  # yields multipart JPEG frames  :contentReference[oaicite:15]{index=15}
+        return StreamingResponse(gen, media_type="multipart/x-mixed-replace; boundary=frame")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"camera stream error: {e}")
+        raise HTTPException(500, f"Camera stream error: {e}")
 
-@app.get("/camera/capture")
+@app.post("/camera/capture")
 def camera_capture():
-    """
-    Capture a still image; return a capture_id and the absolute path.
-    """
     try:
-        path = camera.capture()  # your camera service should save into CAPTURES_DIR
-        if not path:
-            raise RuntimeError("Camera capture returned no path")
-        abs_path = str(Path(path).resolve())
-        capture_id = uuid.uuid4().hex[:8]
-        CAPTURES[capture_id] = abs_path
-        return {"capture_id": capture_id, "path": abs_path}
+        path = camera.capture()  # returns file path  :contentReference[oaicite:16]{index=16}
+        capture_id = uuid.uuid4().hex
+        CAPTURES[capture_id] = path
+        try:
+            models.record_capture(path)  # optional DB
+        except Exception:
+            pass
+        return {"capture_id": capture_id, "path": path}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, f"Capture error: {e}")
 
 # -----------------------------------------------------------------------------
 # OCR endpoints
 # -----------------------------------------------------------------------------
-
 @app.post("/ocr/{capture_id}")
-def ocr_on_capture(capture_id: str):
-    """
-    Run OCR against a previously captured image by capture_id.
-    Returns the ocr result and an ocr_id for auditing.
-    """
+def ocr_run(capture_id: str):
     path = CAPTURES.get(capture_id)
     if not path:
-        raise HTTPException(404, f"Unknown capture_id: {capture_id}")
-
+        raise HTTPException(404, "capture_id unknown")
     try:
-        result = ocr.run(path)
-        ocr_id = uuid.uuid4().hex[:8]
-        payload = {
-            "ocr_id": ocr_id,
-            "capture_id": capture_id,
-            **result,
-        }
-        OCR_RUNS[ocr_id] = payload
-        return payload
+        result = ocr.run(path)  # returns dict with text/conf  :contentReference[oaicite:17]{index=17}
+        ocr_id = uuid.uuid4().hex
+        OCR_RUNS[ocr_id] = result
+        try:
+            cap_row_id = models.record_capture(path)
+            models.record_ocr(cap_row_id, result)
+        except Exception:
+            pass
+        return {"ocr_id": ocr_id, **result}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, f"OCR error: {e}")
 
 # -----------------------------------------------------------------------------
-# Simple pipeline (Capture → OCR). Returns IDs + OCR text/confidence.
+# Assignment / sort pipeline (capture → OCR → decide → move plan)
 # -----------------------------------------------------------------------------
-
 @app.post("/sort")
-def sort_one():
+def sort_pipeline():
+    # Capture
     try:
-        # Capture
         path = camera.capture()
-        if not path:
-            raise RuntimeError("Camera capture returned no path")
-        abs_path = str(Path(path).resolve())
-        capture_id = uuid.uuid4().hex[:8]
-        CAPTURES[capture_id] = abs_path
-
-        # OCR (full image, with your prioritization inside ocr.py if configured)
-        ocr_result = ocr.run(abs_path)
-        ocr_id = uuid.uuid4().hex[:8]
-        OCR_RUNS[ocr_id] = {"ocr_id": ocr_id, "capture_id": capture_id, **ocr_result}
-
-        # If you want to gate progression on confidence / acceptance, check here:
-        accepted = bool(ocr_result.get("accepted", True))
-        if not accepted:
-            # Do not plan or send motion if low quality; surface a clear message
-            return {
-                "capture_id": capture_id,
-                "ocr_id": ocr_id,
-                "assignment_id": None,
-                "move_id": None,
-                "text": ocr_result.get("text", ""),
-                "confidence": ocr_result.get("confidence", 0),
-                "message": "OCR confidence below threshold; not proceeding to motion planning.",
-            }
-
-        # For now we stop after OCR (no assignment/grid planning in this minimal main).
-        return {
-            "capture_id": capture_id,
-            "ocr_id": ocr_id,
-            "assignment_id": None,
-            "move_id": None,
-            "text": ocr_result.get("text", ""),
-            "confidence": ocr_result.get("confidence", 0),
-        }
-
+        capture_id = uuid.uuid4().hex
+        CAPTURES[capture_id] = path
     except Exception as e:
-        log.error("Sort pipeline failed", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, f"Capture error: {e}")
+
+    # OCR
+    try:
+        ocr_res = ocr.run(path)
+        ocr_id = uuid.uuid4().hex
+        OCR_RUNS[ocr_id] = ocr_res
+    except Exception as e:
+        raise HTTPException(500, f"OCR error: {e}")
+
+    # Assign (simple mode; extend for game-specific rules on demand)
+    try:
+        assign.init(CONFIG.assignment or {})  # loads groups/csv if configured  :contentReference[oaicite:18]{index=18}
+        decision = assign.decide(ocr_res.get("text", ""))
+        slot_id = decision.get("slot_id")
+    except Exception as e:
+        raise HTTPException(500, f"Assign error: {e}")
+
+    move_id = None
+    if slot_id:
+        # Convert to XY via GRID
+        if not GRID:
+            raise HTTPException(500, "GRID not initialized")
+        r, c = GRID.slotid_to_rc(int(slot_id))
+        x, y = GRID.slot_rc_to_xy(r, c)  # XY in mm  :contentReference[oaicite:19]{index=19}
+        gcode = _plan_xy_move_gcode(x, y, safe_lift=True)
+        try:
+            motion.send(gcode)  # send G-code list to Marlin  :contentReference[oaicite:20]{index=20}
+            move_id = uuid.uuid4().hex
+        except Exception as e:
+            raise HTTPException(500, f"Motion error: {e}")
+
+    return {
+        "capture_id": capture_id,
+        "ocr_id": ocr_id,
+        "assignment": decision,
+        "move_id": move_id,
+        "text": ocr_res.get("text"),
+        "confidence": ocr_res.get("confidence"),
+    }
 
 # -----------------------------------------------------------------------------
 # Motion endpoints
 # -----------------------------------------------------------------------------
-
 class GCodeBody(BaseModel):
     gcode: List[str]
-
-@app.get("/motion/ports")
-def motion_ports():
-    try:
-        return {"ports": motion.list_ports()}
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-@app.post("/motion/connect")
-def motion_connect(port: Optional[str] = None, baud: Optional[int] = None):
-    try:
-        return motion.connect(port=port, baud=baud)
-    except Exception as e:
-        raise HTTPException(500, str(e))
 
 @app.post("/motion/enable")
 def motion_enable():
@@ -634,10 +398,17 @@ def motion_disable():
     except Exception as e:
         raise HTTPException(500, str(e))
 
-@app.get("/motion/ping")
-def motion_ping():
+@app.post("/motion/connect")
+def motion_connect(port: str = "", baud: int = 0):
     try:
-        return motion.ping()
+        return motion.connect(port=port or None, baud=baud or None)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.post("/motion/disconnect")
+def motion_disconnect():
+    try:
+        return motion.close()
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -661,17 +432,28 @@ def motion_send(body: GCodeBody):
         return motion.send(body.gcode)
     except Exception as e:
         raise HTTPException(500, str(e))
-# add near other motion endpoints
+
 @app.post("/motion/jog")
 def motion_jog(axis: str, delta_mm: float, feed_xy: int = 1200):
+    """
+    Simple jog using relative move via G-code to avoid relying on helper availability.
+    """
+    axis = axis.upper().strip()
+    if axis not in ("X", "Y", "Z"):
+        raise HTTPException(400, "axis must be X, Y, or Z")
     try:
-        return motion.jog(axis=axis, delta_mm=delta_mm, feed_xy=feed_xy)
+        g = ["G91", f"G0 {axis}{float(delta_mm):.3f} F{int(feed_xy)}", "G90"]
+        return motion.send(g)
     except Exception as e:
         raise HTTPException(500, str(e))
-from fastapi import HTTPException
 
+# -----------------------------------------------------------------------------
+# Grid endpoints (zone/letter/cell moves using planner)
+# -----------------------------------------------------------------------------
 @app.get("/grid/zones")
 def grid_list_zones():
+    if not GRID:
+        raise HTTPException(500, "GRID not initialized")
     try:
         return {"zones": GRID.list_zones()}
     except Exception as e:
@@ -679,9 +461,13 @@ def grid_list_zones():
 
 @app.post("/grid/move/zone")
 def grid_move_zone(key: str, safe_lift: bool = True):
+    if not GRID:
+        raise HTTPException(500, "GRID not initialized")
     try:
-        z = GRID.get_zone(key)
-        return motion.goto_xy(z.x_mm, z.y_mm, safe_lift=safe_lift)
+        z = GRID.get_zone(key)  # resolve to XY  :contentReference[oaicite:21]{index=21}
+        g = _plan_xy_move_gcode(z.x_mm, z.y_mm, safe_lift=safe_lift)
+        res = motion.send(g)
+        return {"ok": True, "move_id": uuid.uuid4().hex, "sent": g, "response": res}
     except KeyError as e:
         raise HTTPException(404, str(e))
     except Exception as e:
@@ -689,30 +475,69 @@ def grid_move_zone(key: str, safe_lift: bool = True):
 
 @app.post("/grid/move/rc")
 def grid_move_rc(row: int, col: int, safe_lift: bool = True):
+    if not GRID:
+        raise HTTPException(500, "GRID not initialized")
     try:
-        x, y = GRID.slot_rc_to_xy(row, col)
-        return motion.goto_xy(x, y, safe_lift=safe_lift)
+        x, y = GRID.slot_rc_to_xy(int(row), int(col))
+        g = _plan_xy_move_gcode(x, y, safe_lift=safe_lift)
+        res = motion.send(g)
+        return {"ok": True, "move_id": uuid.uuid4().hex, "sent": g, "response": res}
     except Exception as e:
         raise HTTPException(500, str(e))
 
 @app.post("/grid/move/slotid")
 def grid_move_slotid(slot_id: int, safe_lift: bool = True):
+    if not GRID:
+        raise HTTPException(500, "GRID not initialized")
     try:
-        r, c = GRID.slotid_to_rc(slot_id)
+        r, c = GRID.slotid_to_rc(int(slot_id))
         x, y = GRID.slot_rc_to_xy(r, c)
-        return motion.goto_xy(x, y, safe_lift=safe_lift)
+        g = _plan_xy_move_gcode(x, y, safe_lift=safe_lift)
+        res = motion.send(g)
+        return {"ok": True, "move_id": uuid.uuid4().hex, "sent": g, "response": res}
     except Exception as e:
         raise HTTPException(500, str(e))
 
 @app.post("/grid/move/letter")
 def grid_move_letter(letter: str, safe_lift: bool = True):
+    if not GRID:
+        raise HTTPException(500, "GRID not initialized")
     try:
-        z = GRID.letter_to_zone(letter)
+        z = GRID.letter_to_zone(letter)  # letter → zone via alpha_map  :contentReference[oaicite:22]{index=22}
         if not z:
             raise HTTPException(404, f"No zone mapped for letter '{letter}'")
-        return motion.goto_xy(z.x_mm, z.y_mm, safe_lift=safe_lift)
+        g = _plan_xy_move_gcode(z.x_mm, z.y_mm, safe_lift=safe_lift)
+        res = motion.send(g)
+        return {"ok": True, "move_id": uuid.uuid4().hex, "sent": g, "response": res}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(500, str(e))
 
+# -----------------------------------------------------------------------------
+# Plunger / Vacuum endpoints
+# -----------------------------------------------------------------------------
+@app.post("/plunger/jog")
+def plunger_jog(steps: int, enable: bool = True, delay_us: int = 1200):
+    """
+    Jog the auxiliary stepper (e.g., vacuum) by a signed number of steps.
+    Positive: forward; Negative: reverse.
+    """
+    try:
+        return plunger.jog(steps=steps, enable=enable, delay_us=int(delay_us))  # :contentReference[oaicite:23]{index=23}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.post("/vacuum/on")
+def vacuum_on():
+    try:
+        return plunger.jog(steps=400, enable=True, delay_us=1200)  # tweak steps for your pump  :contentReference[oaicite:24]{index=24}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.post("/vacuum/off")
+def vacuum_off():
+    try:
+        return plunger.jog(steps=-400, enable=True, delay_us=1200)  # reverse/stop  :contentReference[oaicite:25]{index=25}
+    except Exception as e:
+        raise HTTPException(500, str(e))
