@@ -53,70 +53,93 @@ motion:
 # Converts a slot index (e.g., 1..N) or letter ('A'..'Z') into XY coordinates
 # --------
 grid:
-  rows: 1
-  cols: 6
-  origin_xy_mm: [10.0, 10.0]   # center of (row=0,col=0)
-  pitch_xy_mm:  [35.0, 0.0]    # 35 mm step in X, 0 in Y (single row)
+  # Updated grid configuration: 14 columns × 3 rows.
+  rows: 3
+  cols: 14
+  origin_xy_mm: [0.0, 0.0]
+  pitch_xy_mm: [72.0, 100.0]
   row_major: true
 
-  # Optional fine trims per zone key (mm)
   overrides: { }
 
-  # Define named zones (0-based row/col)
+  # All 42 zones defined explicitly. Keys combine column letter (A–N) and row number (1–3).
   zones:
-    - key: FEED
-      type: feeder
-      row: 0
-      col: 0
-    - key: S1
-      type: sort
-      row: 0
-      col: 1
-    - key: S2
-      type: sort
-      row: 0
-      col: 2
-    - key: S3
-      type: sort
-      row: 0
-      col: 3
-    - key: S4
-      type: sort
-      row: 0
-      col: 4
-    - key: S5
-      type: sort
-      row: 0
-      col: 5
+    # Row 1 (index 0)
+    - { key: A1, type: sort, row: 0, col: 0 }
+    - { key: B1, type: sort, row: 0, col: 1 }
+    - { key: C1, type: sort, row: 0, col: 2 }
+    - { key: D1, type: sort, row: 0, col: 3 }
+    - { key: E1, type: sort, row: 0, col: 4 }
+    - { key: F1, type: sort, row: 0, col: 5 }
+    - { key: G1, type: sort, row: 0, col: 6 }
+    - { key: H1, type: sort, row: 0, col: 7 }
+    - { key: I1, type: sort, row: 0, col: 8 }
+    - { key: J1, type: sort, row: 0, col: 9 }
+    - { key: K1, type: sort, row: 0, col: 10 }
+    - { key: L1, type: sort, row: 0, col: 11 }
+    - { key: M1, type: sort, row: 0, col: 12 }
+    - { key: N1, type: sort, row: 0, col: 13 }
 
-  # Optional: map letters to zone keys for alphabetizing (enable when ready)
+    # Row 2 (index 1)
+    - { key: A2, type: sort, row: 1, col: 0 }
+    - { key: B2, type: sort, row: 1, col: 1 }
+    - { key: C2, type: sort, row: 1, col: 2 }
+    - { key: D2, type: sort, row: 1, col: 3 }
+    - { key: E2, type: sort, row: 1, col: 4 }
+    - { key: F2, type: sort, row: 1, col: 5 }
+    - { key: G2, type: sort, row: 1, col: 6 }
+    - { key: H2, type: sort, row: 1, col: 7 }
+    - { key: I2, type: sort, row: 1, col: 8 }
+    - { key: J2, type: sort, row: 1, col: 9 }
+    - { key: K2, type: sort, row: 1, col: 10 }
+    - { key: L2, type: sort, row: 1, col: 11 }
+    - { key: M2, type: sort, row: 1, col: 12 }
+    - { key: N2, type: sort, row: 1, col: 13 }
+
+    # Row 3 (index 2)
+    - { key: A3, type: sort, row: 2, col: 0 }
+    - { key: B3, type: sort, row: 2, col: 1 }
+    - { key: C3, type: sort, row: 2, col: 2 }
+    - { key: D3, type: sort, row: 2, col: 3 }
+    - { key: E3, type: sort, row: 2, col: 4 }
+    - { key: F3, type: sort, row: 2, col: 5 }
+    - { key: G3, type: sort, row: 2, col: 6 }
+    - { key: H3, type: sort, row: 2, col: 7 }
+    - { key: I3, type: sort, row: 2, col: 8 }
+    - { key: J3, type: sort, row: 2, col: 9 }
+    - { key: K3, type: sort, row: 2, col: 10 }
+    - { key: L3, type: sort, row: 2, col: 11 }
+    - { key: M3, type: sort, row: 2, col: 12 }
+    - { key: N3, type: sort, row: 2, col: 13 }
+
+  # Default mapping from letters A–Z to zones for simple alphabetical sorting.
   alpha_map:
-    A: S1
-    B: S1
-    C: S1
-    D: S2
-    E: S2
-    F: S2
-    G: S3
-    H: S3
-    I: S3
-    J: S4
-    K: S4
-    L: S4
-    M: S5
-    N: S5
-    O: S5
-    P: S5
-    Q: S5
-    R: S5
-    S: S5
-    T: S5
-    U: S5
-    V: S5
-    W: S5
-    X: S5
-    Y: S5
-    Z: S5
+    A: A1
+    B: B1
+    C: C1
+    D: D1
+    E: E1
+    F: F1
+    G: G1
+    H: H1
+    I: I1
+    J: J1
+    K: K1
+    L: L1
+    M: M1
+    N: N1
+    O: A2
+    P: B2
+    Q: C2
+    R: D2
+    S: E2
+    T: F2
+    U: G2
+    V: H2
+    W: I2
+    X: J2
+    Y: K2
+    Z: L2
 
 # --------
 # PLUNGER / ACTUATOR (optional)
