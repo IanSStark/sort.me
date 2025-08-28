@@ -93,6 +93,66 @@
   </div>
 </section>
 
+  <!-- Grid Navigation -->
+  <section class="card" style="max-width: 960px; margin:20px auto;">
+    <h2>Grid Navigation</h2>
+    <div class="content">
+      <div class="row">
+        <button id="btnUp"    class="btn">↑</button>
+        <button id="btnDown"  class="btn">↓</button>
+        <button id="btnLeft"  class="btn">←</button>
+        <button id="btnRight" class="btn">→</button>
+        <button id="btnPrevCell" class="btn">Prev Cell</button>
+        <button id="btnNextCell" class="btn">Next Cell</button>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <div class="hint">Current Cell:</div>
+        <div id="currentCell">A1</div>
+      </div>
+      <div class="row" style="margin-top:8px; align-items:center;">
+        <label style="display:flex; align-items:center; gap:8px;">
+          <input type="checkbox" id="chkSafeLiftGrid" checked>
+          <span class="hint">Safe-lift Z</span>
+        </label>
+      </div>
+    </div>
+  </section>
+
+  <!-- Z Axis Control -->
+  <section class="card" style="max-width: 960px; margin:20px auto;">
+    <h2>Z Axis Control</h2>
+    <div class="content">
+      <div class="row">
+        <button id="btnZUp"   class="btn">Z +10</button>
+        <button id="btnZDown" class="btn">Z -10</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Vacuum Control -->
+  <section class="card" style="max-width: 960px; margin:20px auto;">
+    <h2>Vacuum Control</h2>
+    <div class="content">
+      <div class="row">
+        <button id="btnVacuumOn"  class="btn">Vacuum On</button>
+        <button id="btnVacuumOff" class="btn">Vacuum Off</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Sorting Mode -->
+  <section class="card" style="max-width: 960px; margin:20px auto;">
+    <h2>Sorting Mode</h2>
+    <div class="content">
+      <select id="sortMode" class="btn">
+        <option value="alpha">Alphabetical</option>
+        <option value="yearset">Year → Set → Alpha</option>
+        <option value="mtg">MTG</option>
+        <option value="yugioh">YuGiOh</option>
+      </select>
+    </div>
+  </section>
+
 <!-- Zone moves -->
 <section class="card" style="max-width: 960px; margin:20px auto;">
   <h2>Zone Moves</h2>
@@ -133,7 +193,7 @@
   }
   function log(msg) {
     const el = document.getElementById('log');
-    el.value += (el.value ? '\n' : '') + (typeof msg === 'string' ? msg : JSON.stringify(msg, null, 2));
+    el.value += (el.value ? '\\n' : '') + (typeof msg === 'string' ? msg : JSON.stringify(msg, null, 2));
     el.scrollTop = el.scrollHeight;
   }
   function set(id, v) { document.getElementById(id).textContent = (v ?? '–'); }
@@ -300,6 +360,129 @@
 
   // initial load
   loadZones();
+
+  // --- grid navigation state ---
+  let currentRow = 0;
+  let currentCol = 0;
+
+  function updateCurrentCellDisplay() {
+    const letter = String.fromCharCode(65 + currentCol);
+    const cell = letter + (currentRow + 1);
+    document.getElementById('currentCell').textContent = cell;
+  }
+
+  async function moveToCurrentCell() {
+    const safe = document.getElementById('chkSafeLiftGrid').checked;
+    const row = currentRow;
+    const col = currentCol;
+    const letter = String.fromCharCode(65 + col);
+    const cell = letter + (row + 1);
+    try {
+      log(`Move to cell ${cell}…`);
+      const res = await api(`/grid/move/rc?row=${row}&col=${col}&safe_lift=${safe}`, { method: 'POST' });
+      lastMoveId = res.move_id;
+      updateIds();
+      log(res);
+    } catch (e) {
+      log('Grid move error: ' + e.message);
+    }
+    updateCurrentCellDisplay();
+  }
+
+  // Navigation button handlers
+  document.getElementById('btnUp').addEventListener('click', async () => {
+    if (currentRow > 0) {
+      currentRow -= 1;
+      await moveToCurrentCell();
+    }
+  });
+  document.getElementById('btnDown').addEventListener('click', async () => {
+    if (currentRow < 2) {
+      currentRow += 1;
+      await moveToCurrentCell();
+    }
+  });
+  document.getElementById('btnLeft').addEventListener('click', async () => {
+    if (currentCol > 0) {
+      currentCol -= 1;
+      await moveToCurrentCell();
+    }
+  });
+  document.getElementById('btnRight').addEventListener('click', async () => {
+    if (currentCol < 13) {
+      currentCol += 1;
+      await moveToCurrentCell();
+    }
+  });
+  document.getElementById('btnNextCell').addEventListener('click', async () => {
+    currentCol += 1;
+    if (currentCol > 13) {
+      currentCol = 0;
+      currentRow = (currentRow + 1) % 3;
+    }
+    await moveToCurrentCell();
+  });
+  document.getElementById('btnPrevCell').addEventListener('click', async () => {
+    currentCol -= 1;
+    if (currentCol < 0) {
+      currentCol = 13;
+      currentRow = (currentRow - 1 + 3) % 3;
+    }
+    await moveToCurrentCell();
+  });
+  updateCurrentCellDisplay();
+
+  // Z-axis control handlers
+  document.getElementById('btnZUp').addEventListener('click', async () => {
+    try {
+      log('Z +10');
+      const res = await api('/motion/jog?axis=Z&delta_mm=10&feed_xy=1200', { method: 'POST' });
+      lastMoveId = res.move_id;
+      updateIds();
+      log(res);
+    } catch (e) {
+      log('Z jog error: ' + e.message);
+    }
+  });
+  document.getElementById('btnZDown').addEventListener('click', async () => {
+    try {
+      log('Z -10');
+      const res = await api('/motion/jog?axis=Z&delta_mm=-10&feed_xy=1200', { method: 'POST' });
+      lastMoveId = res.move_id;
+      updateIds();
+      log(res);
+    } catch (e) {
+      log('Z jog error: ' + e.message);
+    }
+  });
+
+  // Vacuum control handlers
+  document.getElementById('btnVacuumOn').addEventListener('click', async () => {
+    try {
+      log('Vacuum on');
+      const res = await api('/vacuum/on', { method: 'POST' });
+      log(res);
+    } catch (e) {
+      log('Vacuum on error: ' + e.message);
+    }
+  });
+  document.getElementById('btnVacuumOff').addEventListener('click', async () => {
+    try {
+      log('Vacuum off');
+      const res = await api('/vacuum/off', { method: 'POST' });
+      log(res);
+    } catch (e) {
+      log('Vacuum off error: ' + e.message);
+    }
+  });
+
+  // Sorting mode selection (placeholder)
+  const sortModeSelect = document.getElementById('sortMode');
+  let sortMode = sortModeSelect.value;
+  sortModeSelect.addEventListener('change', (e) => {
+    sortMode = e.target.value;
+    log(`Sorting mode set to ${sortMode}`);
+  });
 </script>
 </body>
 </html>
